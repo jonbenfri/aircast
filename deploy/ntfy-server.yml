@@ -1,0 +1,12 @@
+# /etc/ntfy/server.yml
+# Served publicly through nginx (deploy/nginx-ntfy.conf).
+base-url: "https://ntfy.example.com"
+listen-http: "127.0.0.1:2586"   # only nginx talks to it from outside
+behind-proxy: true
+
+cache-file: "/var/cache/ntfy/cache.db"
+cache-duration: "24h"
+
+# Private server: nobody can read or post without an account.
+auth-file: "/var/lib/ntfy/user.db"
+auth-default-access: "deny-all"

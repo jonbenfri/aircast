@@ -1,0 +1,7 @@
+[project]
+name = "aqi-monitor"
+version = "0.1.0"
+description = "Forecasts when US AQI near you will exceed a threshold and pushes alerts via ntfy"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []

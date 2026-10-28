@@ -1,0 +1,21 @@
+[Unit]
+Description=AQI forecast monitor (pushes alerts via ntfy)
+Wants=network-online.target
+After=network-online.target ntfy.service
+
+[Service]
+Type=simple
+User=aqi
+EnvironmentFile=/etc/aqi-monitor.env
+ExecStart=/opt/aqi-monitor/.venv/bin/python /opt/aqi-monitor/aqi_monitor.py run
+Restart=always
+RestartSec=30
+# Kept to options that old systemd (e.g. 229 on Ubuntu 16.04) understands.
+# /var/lib/aqi-monitor is created by hand (see README) since StateDirectory= needs systemd 235+.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
