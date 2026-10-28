@@ -61,9 +61,15 @@ Each poll (every 15 min by default):
    | 4 | plume overhead |
    | 5 | dense overhead: overlapping plumes (density weights ≥ 3) or a heavy plume |
 
-   Each alert lists plumes overhead, within 50 mi and within 50–100 mi, the nearest
-   plume's distance and direction, and a score (overhead density weights +
-   0.5 × within 50 mi + 0.25 × within 100 mi + 0.125 × within 200 mi; light = 1, medium = 2, heavy = 3).
+   **Plumes, not polygons:** NOAA draws light, medium and heavy areas inside one
+   another and repeats outlines across satellite passes, so polygons that overlap or
+   come within 5 km of each other are merged into one plume. A plume counts once in
+   the total, and appears in **every distance band it reaches**: a plume stretching
+   from 75 to 250 mi shows in both 50–100 and 100–200 mi. Example:
+   `Smoke: 2 plumes within 200 mi  ||  reaching 0–50 mi: 0  ||  50–100 mi: 1  ||  100–200 mi: 2  ||  score 0.4`.
+   The score adds each plume once, by its nearest edge: density weight (light 1,
+   medium 2, heavy 3) × 1 overhead, 0.5 within 50 mi, 0.25 within 100 mi, 0.125
+   within 200 mi. Level 5 means heavy smoke overhead.
    It's flagged **incoming** when the back-trajectories (near-ground or aloft)
    start inside a plume within the next 24 h (`AQI_WATCH_HOURS`). Overhead and
    incoming alerts include the mixing height, so you can tell whether smoke aloft
@@ -204,7 +210,7 @@ where the `aqi` service user couldn't read it.
 cd /opt/aircast
 sudo useradd --system --no-create-home aqi
 sudo mkdir -p /var/lib/aircast && sudo chown aqi:aqi /var/lib/aircast
-sudo cp deploy/aircast.env.example /etc/aircast.env && sudo chmod 600 /etc/aircast.env
+sudo cp deploy/aircast.env.example /etc/aircast.env && sudo chgrp aqi /etc/aircast.env && sudo chmod 640 /etc/aircast.env
 sudo nano /etc/aircast.env
 ```
 
@@ -232,8 +238,9 @@ Then run `sudo nginx -t && sudo systemctl reload nginx` and set
 **8. Test:**
 
 ```bash
-sudo -u aqi env $(sudo grep -v '^#' /etc/aircast.env | xargs -d '\n') /opt/aircast/.venv/bin/python /opt/aircast/aircast.py test-notify
-sudo -u aqi env $(sudo grep -v '^#' /etc/aircast.env | xargs -d '\n') AQI_DB=/tmp/aircast-test.db /opt/aircast/.venv/bin/python /opt/aircast/aircast.py status
+sudo -u aqi /opt/aircast/.venv/bin/python /opt/aircast/aircast.py --env /etc/aircast.env test-notify
+sudo -u aqi /opt/aircast/.venv/bin/python /opt/aircast/aircast.py --env /etc/aircast.env status
+sudo -u aqi /opt/aircast/.venv/bin/python /opt/aircast/aircast.py --env /etc/aircast.env score
 journalctl -u aircast -f
 ```
 

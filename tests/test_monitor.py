@@ -245,17 +245,42 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(self.level([plume_at(180, 140)]).level, 2)   # edge ~75 mi
         self.assertEqual(self.level([plume_at(180, 70)]).level, 3)    # edge ~31 mi
         self.assertEqual(self.level([square(LAT, LON, 30)]).level, 4)
-        dense = self.level([square(LAT, LON, 30, "medium"), square(LAT, LON, 50)])
-        self.assertEqual(dense.level, 5)
-        self.assertEqual(dense.overhead, ["medium", "light"])
+        nested = self.level([square(LAT, LON, 30, "medium"), square(LAT, LON, 50)])
+        self.assertEqual((nested.level, nested.n_plumes, nested.overhead), (4, 1, ["medium"]))
         self.assertEqual(self.level([square(LAT, LON, 30, "heavy")]).level, 5)
         self.assertEqual(m.assess_smoke(cfg(smoke_far_mi=100), [plume_at(180, 250)], []).level, 0)
 
     def test_overhead_plus_second_plume_nearby(self):
         sm = self.level([square(LAT, LON, 30), plume_at(270, 80)])
         self.assertEqual(sm.level, 4)
-        self.assertEqual(sm.n50, 1)
+        self.assertEqual(sm.n_plumes, 2)
+        self.assertEqual(sm.n50, 2)  # the overhead plume covers 0-50 mi too
         self.assertAlmostEqual(sm.score, 1.5)
+
+    def test_far_reaching_plume_counts_in_every_band(self):
+        """One long plume from ~75 mi to ~250 mi away: one plume, present in two bands."""
+        la, lo = m.destination(LAT, LON, 180, 260)
+        long_plume = m.Plume("light", None, NOW, [], (0, 0, 0, 0))
+        dlat, dlon = 140 / 110.57, 40 / (111.32 * math.cos(math.radians(la)))
+        ring = [(lo - dlon, la - dlat), (lo - dlon, la + dlat), (lo + dlon, la + dlat), (lo + dlon, la - dlat)]
+        long_plume.rings, long_plume.bbox = [ring], (lo - dlon, la - dlat, lo + dlon, la + dlat)
+        sm = self.level([long_plume])
+        self.assertEqual((sm.level, sm.n_plumes, sm.n50, sm.n100, sm.n_far), (2, 1, 0, 1, 1))
+        self.assertIn("1 plume within 200 mi", m.smoke_line(sm))
+
+    def test_pieces_of_one_plume_count_once(self):
+        """Many small polygons inside or touching a big one, plus a separate plume elsewhere."""
+        big = plume_at(180, 150, half_km=60)
+        pieces = [plume_at(180, 150 + d, half_km=8, density="medium") for d in (-40, 0, 40)]
+        touching = plume_at(180, 150 + 60 + 20 + 2, half_km=20)  # 2 km gap: same plume
+        other = plume_at(270, 150, half_km=30)
+        sm = self.level([big, *pieces, touching, other])
+        self.assertEqual(sm.n_plumes, 2)
+
+    def test_gap_keeps_plumes_apart(self):
+        a_ = plume_at(180, 150, half_km=30)
+        b_ = plume_at(180, 150 + 30 + 30 + 40, half_km=30)  # 40 km apart
+        self.assertEqual(self.level([a_, b_]).n_plumes, 2)
 
     def test_nearest_distance_and_direction(self):
         sm = self.level([plume_at(180, 70)])
@@ -442,3 +467,20 @@ class LearningTest(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             m.print_score(cfg(), store, 1e6)
         self.assertIn("hits 1", out.getvalue())
+
+
+class EnvFileTest(unittest.TestCase):
+    def test_load_env_file_keeps_spaces(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
+            f.write("# comment\nAQI_PLACE=Rochester, NY\nTZ='America/New_York'\n\nNTFY_TOPIC=aqi\n")
+        for k in ("AQI_PLACE", "TZ", "NTFY_TOPIC"):
+            os.environ.pop(k, None)
+        try:
+            m.load_env_file(f.name)
+            self.assertEqual(os.environ["AQI_PLACE"], "Rochester, NY")
+            self.assertEqual(os.environ["TZ"], "America/New_York")
+        finally:
+            for k in ("AQI_PLACE", "TZ", "NTFY_TOPIC"):
+                os.environ.pop(k, None)
+            os.unlink(f.name)

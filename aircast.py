@@ -1010,6 +1010,105 @@ def plume_distance(lat: float, lon: float, p: Plume) -> Tuple[float, float]:
     return best, math.degrees(math.atan2(bx, by)) % 360
 
 
+def _seg_dist(px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> float:
+    dx, dy = x2 - x1, y2 - y1
+    L = dx * dx + dy * dy
+    f = 0.0 if L == 0 else max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / L))
+    return math.hypot(px - (x1 + f * dx), py - (y1 + f * dy))
+
+
+def _segs_cross(a1, a2, b1, b2) -> bool:
+    def orient(p, q, r):
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+    d1, d2 = orient(b1, b2, a1), orient(b1, b2, a2)
+    d3, d4 = orient(a1, a2, b1), orient(a1, a2, b2)
+    return (d1 > 0) != (d2 > 0) and (d3 > 0) != (d4 > 0)
+
+
+def _poly_gap_km(A: List[List[Tuple[float, float]]], B: List[List[Tuple[float, float]]],
+                 limit: float) -> float:
+    """Distance between two polygons given as rings of local (x, y) km; 0 if they overlap.
+    Stops early once it's below `limit`."""
+    for ring in A:
+        if _inside(ring[0][0], ring[0][1], B):
+            return 0.0
+    for ring in B:
+        if _inside(ring[0][0], ring[0][1], A):
+            return 0.0
+    best = float("inf")
+    for ra in A:
+        for a1, a2 in zip(ra, ra[1:] + ra[:1]):
+            for rb in B:
+                for b1, b2 in zip(rb, rb[1:] + rb[:1]):
+                    if _segs_cross(a1, a2, b1, b2):
+                        return 0.0
+                    best = min(best, _seg_dist(*a1, *b1, *b2), _seg_dist(*b1, *a1, *a2))
+                    if best <= limit:
+                        return best
+    return best
+
+
+@dataclass
+class PlumeCluster:
+    """Overlapping or touching HMS polygons merged into one plume (nested densities,
+    repeated satellite passes and small pieces of a big plume all count once)."""
+    members: List[Plume]
+    min_km: float      # nearest edge; 0 when overhead
+    max_km: float      # farthest point
+    bearing: float     # toward the nearest edge
+    density: str       # densest part of the plume
+    here: Optional[str]  # density at your location, if overhead
+
+    @property
+    def weight(self) -> int:
+        return DENSITY_WEIGHT.get(self.here or self.density, 1)
+
+
+def cluster_plumes(cfg: Config, plumes: List[Plume], reach_km: float, gap_km: float = 5.0) -> List[PlumeCluster]:
+    """Merge polygons within gap_km of each other into plumes; keep those reaching within reach_km."""
+    # Generous prefilter so a plume's far-off pieces can still join it.
+    lat_pad = (reach_km + 400) / 110.57
+    cand = [p for p in plumes if p.bbox[1] - lat_pad < cfg.lat < p.bbox[3] + lat_pad]
+    xy = [[[local_km(cfg.lat, cfg.lon, la, lo) for lo, la in ring] for ring in p.rings] for p in cand]
+    boxes = []
+    for rings in xy:
+        xs = [x for r in rings for x, _ in r]
+        ys = [y for r in rings for _, y in r]
+        boxes.append((min(xs), min(ys), max(xs), max(ys)))
+
+    parent = list(range(len(cand)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(cand)):
+        for j in range(i + 1, len(cand)):
+            bi, bj = boxes[i], boxes[j]
+            if bi[0] - gap_km > bj[2] or bj[0] - gap_km > bi[2] or bi[1] - gap_km > bj[3] or bj[1] - gap_km > bi[3]:
+                continue
+            if find(i) != find(j) and _poly_gap_km(xy[i], xy[j], gap_km) <= gap_km:
+                parent[find(i)] = find(j)
+
+    groups: Dict[int, List[int]] = {}
+    for i in range(len(cand)):
+        groups.setdefault(find(i), []).append(i)
+    out = []
+    for idx in groups.values():
+        members = [cand[i] for i in idx]
+        here = [cand[i].density for i in idx if _inside(0.0, 0.0, xy[i])]
+        nearest = min((plume_distance(cfg.lat, cfg.lon, cand[i]) for i in idx), key=lambda d: d[0])
+        far = max(math.hypot(x, y) for i in idx for r in xy[i] for x, y in r)
+        if nearest[0] > reach_km:
+            continue
+        dens = max((m.density for m in members), key=lambda d: DENSITY_WEIGHT.get(d, 1))
+        out.append(PlumeCluster(members, nearest[0], far, nearest[1], dens,
+                                max(here, key=lambda d: DENSITY_WEIGHT.get(d, 1)) if here else None))
+    return sorted(out, key=lambda c: c.min_km)
+
+
 SMOKE_NAMES = {0: "none", 1: "within far radius", 2: "within 100 mi", 3: "within 50 mi",
                4: "overhead", 5: "dense overhead"}
 
@@ -1017,15 +1116,16 @@ SMOKE_NAMES = {0: "none", 1: "within far radius", 2: "within 100 mi", 3: "within
 @dataclass
 class Smoke:
     level: int
-    overhead: List[str]  # densities of plumes directly overhead
-    n50: int             # plumes 0-50 mi away (not overhead)
-    n100: int            # plumes 50-100 mi away
+    overhead: List[str]  # density at your location of each plume overhead (normally 0 or 1)
+    n50: int             # plumes reaching into 0-50 mi (a plume counts in every band it spans)
+    n100: int            # plumes reaching into 50-100 mi
     nearest_km: Optional[float]
     nearest_brg: float
-    score: float         # overhead + 0.5 x within 50 + 0.25 x within 100 + 0.125 x within far radius
+    score: float         # per plume: weight x (1 overhead, 0.5 <=50 mi, 0.25 <=100 mi, 0.125 <=far)
     analysed: Optional[int]
-    n_far: int = 0       # plumes 100 mi - smoke_far_mi away
+    n_far: int = 0       # plumes reaching into 100 mi - smoke_far_mi
     far_mi: float = 200.0
+    n_plumes: int = 0    # distinct plumes within far_mi
     incoming_eta: Optional[int] = None
     incoming_support: float = 0.0
     incoming_density: str = ""
@@ -1039,35 +1139,26 @@ class Smoke:
 def assess_smoke(cfg: Config, plumes: List[Plume], trajs: List[Trajectory],
                  trajs_aloft: Optional[List[Trajectory]] = None,
                  blh: Optional[Dict[int, float]] = None, now: Optional[float] = None) -> Smoke:
-    over, n50, n100, n_far, score = [], 0, 0, 0, 0.0
-    near: Optional[Tuple[float, float]] = None
-    for p in plumes:
-        # Cheap reject: bbox more than ~600 km away.
-        if not (p.bbox[1] - 5.5 < cfg.lat < p.bbox[3] + 5.5):
-            continue
-        d, brg = plume_distance(cfg.lat, cfg.lon, p)
-        if d == 0:
-            over.append(p.density)
-            score += p.weight
-            continue
-        if near is None or d < near[0]:
-            near = (d, brg)
-        if d <= 50 * MI:
-            n50 += 1
-            score += 0.5 * p.weight
-        elif d <= 100 * MI:
-            n100 += 1
-            score += 0.25 * p.weight
-        elif d <= cfg.smoke_far_mi * MI:
-            n_far += 1
-            score += 0.125 * p.weight
-    over_w = sum(DENSITY_WEIGHT.get(d, 1) for d in over)
-    level = (5 if over and (over_w >= 3 or len(over) >= 3) else 4 if over
-             else 3 if n50 else 2 if n100 else 1 if n_far else 0)
+    far_km = cfg.smoke_far_mi * MI
+    bands = [(0.0, 50 * MI, 0.5), (50 * MI, 100 * MI, 0.25), (100 * MI, far_km, 0.125)]
+    clusters = cluster_plumes(cfg, plumes, far_km)
+    counts = [sum(1 for c in clusters if c.min_km <= hi and c.max_km >= lo) for lo, hi, _ in bands]
+    over = [c.here for c in clusters if c.here]
+    score = 0.0
+    for c in clusters:
+        factor = 1.0 if c.here else next(w for lo, hi, w in bands if c.min_km <= hi)
+        score += factor * c.weight
+    away = [c for c in clusters if not c.here]
+    nearest = away[0] if away else None
+    level = (5 if "heavy" in over else 4 if over
+             else 3 if nearest and nearest.min_km <= 50 * MI
+             else 2 if nearest and nearest.min_km <= 100 * MI
+             else 1 if nearest else 0)
     ends = [p.end for p in plumes if p.end]
-    sm = Smoke(level, sorted(over, key=lambda d: -DENSITY_WEIGHT.get(d, 1)), n50, n100,
-               near[0] if near else None, near[1] if near else 0.0, score, max(ends) if ends else None,
-               n_far=n_far, far_mi=cfg.smoke_far_mi)
+    sm = Smoke(level, sorted(over, key=lambda d: -DENSITY_WEIGHT.get(d, 1)), counts[0], counts[1],
+               nearest.min_km if nearest else None, nearest.bearing if nearest else 0.0, score,
+               max(ends) if ends else None, n_far=counts[2], far_mi=cfg.smoke_far_mi,
+               n_plumes=len(clusters))
     if now is not None:
         sm.mix_now = blh_at(blh or {}, now)
 
@@ -1097,10 +1188,10 @@ def assess_smoke(cfg: Config, plumes: List[Plume], trajs: List[Trajectory],
 
 
 def smoke_details(sm: Smoke) -> str:
-    parts = []
+    parts = [f"{sm.n_plumes} within {sm.far_mi:.0f} mi"]
     if sm.overhead:
         parts.append(f"overhead: {len(sm.overhead)} ({', '.join(sm.overhead)})")
-    parts.append(f"within 50 mi: {sm.n50}")
+    parts.append(f"reaching 0-50 mi: {sm.n50}")
     parts.append(f"50-100 mi: {sm.n100}")
     parts.append(f"100-{sm.far_mi:.0f} mi: {sm.n_far}")
     if sm.nearest_km is not None and not sm.overhead:
@@ -1110,16 +1201,13 @@ def smoke_details(sm: Smoke) -> str:
 
 
 def smoke_line(sm: Smoke) -> str:
-    items = []
+    """e.g. 'Smoke: 2 plumes within 200 mi  ||  reaching 0–50 mi: 0  ||  50–100 mi: 1  ||  100–200 mi: 2  ||  score 0.4'.
+    A plume counts in every distance band it reaches; overlapping pieces count as one plume."""
+    head = f"{sm.n_plumes} {'plume' if sm.n_plumes == 1 else 'plumes'} within {sm.far_mi:.0f} mi"
     if sm.overhead:
-        k = len(sm.overhead)
-        items.append(f"{k} {'plume' if k == 1 else 'plumes'} overhead ({', '.join(sm.overhead)})")
-        items.append(f"{sm.n50} within 50 mi")
-    else:
-        items.append(f"{sm.n50} {'plume' if sm.n50 == 1 else 'plumes'} within 50 mi")
-    items.append(f"{sm.n100} at 50–100 mi")
-    items.append(f"{sm.n_far} at 100–{sm.far_mi:.0f} mi")
-    items.append(f"score {sm.score:.1f}")
+        head += f", {len(sm.overhead)} overhead ({', '.join(sm.overhead)})"
+    items = [head, f"reaching 0–50 mi: {sm.n50}", f"50–100 mi: {sm.n100}",
+             f"100–{sm.far_mi:.0f} mi: {sm.n_far}", f"score {sm.score:.1f}"]
     return "Smoke: " + SEP.join(items)
 
 
@@ -1617,11 +1705,29 @@ def print_status(cfg: Config, a: Assessment) -> None:
               f"{h.corrected:6.0f} {h.sigma:5.1f} {h.p_exceed:6.0%} {bar}")
 
 
+def load_env_file(path: str) -> None:
+    """KEY=VALUE lines like systemd's EnvironmentFile (values may contain spaces; quotes optional).
+    Variables already set in the environment win."""
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            val = val.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+                val = val[1:-1]
+            os.environ.setdefault(key.strip(), val)
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p.add_argument("--env", metavar="FILE", help="read settings from FILE, e.g. /etc/aircast.env")
     p.add_argument("command", choices=["run", "once", "status", "score", "test-notify"], nargs="?", default="run")
     p.add_argument("days", nargs="?", type=float, default=30, help="score: how many days back")
     args = p.parse_args(argv)
+    if args.env:
+        load_env_file(args.env)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = Config.from_env()
 
