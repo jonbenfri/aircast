@@ -340,7 +340,9 @@ def nearest_observation(cfg: Config, stations: List["Station"]) -> Optional[Tupl
 
 
 def fetch_stations(cfg: Config) -> List[Station]:
-    """Latest hourly AQI (worst pollutant) at every AirNow monitor within ~upwind_km.
+    """Latest hourly AQI (worst pollutant) at every AirNow monitor within upwind_km.
+
+    AirNow only takes a bounding box, so the box corners are trimmed back to a circle.
 
     Includes ozone/CO/NO2, not just PM: smoke VOCs + NOx make ozone downwind.
     """
@@ -373,7 +375,8 @@ def fetch_stations(cfg: Config) -> List[Station]:
         # Newest hour wins; within the same hour keep the worse pollutant.
         if prev is None or utc > prev[0] or (utc == prev[0] and st.aqi > prev[1].aqi):
             latest[key] = (utc, st)
-    return [st for _, st in latest.values()]
+    return [st for _, st in latest.values()
+            if distance_bearing(cfg.lat, cfg.lon, st.lat, st.lon)[0] <= cfg.upwind_km]
 
 
 # --------------------------------------------------------------------------- math

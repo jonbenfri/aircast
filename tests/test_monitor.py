@@ -65,6 +65,19 @@ class MathTest(unittest.TestCase):
         self.assertEqual(obs[1], 20)
         self.assertEqual(m.nearest_observation(cfg(), [road])[1], 60)  # still used if it's all we have
 
+    def test_stations_trimmed_to_circle(self):
+        rows = []
+        for brg, km in [(0, 200), (45, 300), (90, 240)]:  # 300 km NE is inside the box, outside the circle
+            la, lo = m.destination(LAT, LON, brg, km)
+            rows.append({"Latitude": la, "Longitude": lo, "UTC": "2026-10-28T12:00", "AQI": 20, "SiteName": f"s{brg}"})
+        orig = m._get_json
+        m._get_json = lambda url, params, timeout=20: rows
+        try:
+            names = sorted(st.name for st in m.fetch_stations(cfg(airnow_key="k", upwind_km=250)))
+        finally:
+            m._get_json = orig
+        self.assertEqual(names, ["s0", "s90"])
+
     def test_compass(self):
         self.assertEqual(m.compass(185), "S")
         self.assertEqual(m.compass(350), "N")
