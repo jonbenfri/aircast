@@ -987,7 +987,7 @@ def smoke_line(sm: Smoke) -> str:
 def decide_smoke(cfg: Config, st: Dict[str, float], sm: Smoke, a: Assessment,
                  now: float) -> Optional["Message"]:
     """st holds notified (level last alerted), incoming (0/1), below_since. Mutated in place."""
-    sat = f"🌎🛰️ {as_of(sm.analysed, now)}" if sm.analysed else ""
+    sat = f"🛰️🌎🛰️ {as_of(sm.analysed, now)}" if sm.analysed else ""
     wind = wind_outlook(a)
     notified = int(st.get("notified", 0))
     if sm.level > notified:
