@@ -121,6 +121,7 @@ class Config:
     smoke: bool = True
     hms_url: Optional[str] = None
     smoke_clear_hours: float = 3.0
+    smoke_far_mi: float = 200.0
     obs_weight: float = 0.6
     airnow_key: Optional[str] = None
     airnow_distance: int = 25
@@ -164,6 +165,7 @@ class Config:
             smoke=_env("AQI_SMOKE", "1") not in ("0", "false", "no"),
             hms_url=_env("AQI_HMS_URL"),
             smoke_clear_hours=f("AQI_SMOKE_CLEAR_HOURS", 3),
+            smoke_far_mi=f("AQI_SMOKE_FAR_MI", 200),
             obs_weight=f("AQI_OBS_WEIGHT", 0.6),
             airnow_key=_env("AIRNOW_API_KEY"),
             airnow_distance=int(f("AIRNOW_DISTANCE_MILES", 25)),
@@ -894,7 +896,8 @@ def plume_distance(lat: float, lon: float, p: Plume) -> Tuple[float, float]:
     return best, math.degrees(math.atan2(bx, by)) % 360
 
 
-SMOKE_NAMES = {0: "none", 1: "within 100 mi", 2: "within 50 mi", 3: "overhead", 4: "dense overhead"}
+SMOKE_NAMES = {0: "none", 1: "within far radius", 2: "within 100 mi", 3: "within 50 mi",
+               4: "overhead", 5: "dense overhead"}
 
 
 @dataclass
@@ -905,8 +908,10 @@ class Smoke:
     n100: int            # plumes 50-100 mi away
     nearest_km: Optional[float]
     nearest_brg: float
-    score: float         # overhead weights + 0.5 x within 50 mi + 0.25 x within 100 mi
+    score: float         # overhead + 0.5 x within 50 + 0.25 x within 100 + 0.125 x within far radius
     analysed: Optional[int]
+    n_far: int = 0       # plumes 100 mi - smoke_far_mi away
+    far_mi: float = 200.0
     incoming_eta: Optional[int] = None
     incoming_support: float = 0.0
     incoming_density: str = ""
@@ -915,7 +920,7 @@ class Smoke:
 
 
 def assess_smoke(cfg: Config, plumes: List[Plume], trajs: List[Trajectory]) -> Smoke:
-    over, n50, n100, score = [], 0, 0, 0.0
+    over, n50, n100, n_far, score = [], 0, 0, 0, 0.0
     near: Optional[Tuple[float, float]] = None
     for p in plumes:
         # Cheap reject: bbox more than ~600 km away.
@@ -934,16 +939,20 @@ def assess_smoke(cfg: Config, plumes: List[Plume], trajs: List[Trajectory]) -> S
         elif d <= 100 * MI:
             n100 += 1
             score += 0.25 * p.weight
+        elif d <= cfg.smoke_far_mi * MI:
+            n_far += 1
+            score += 0.125 * p.weight
     over_w = sum(DENSITY_WEIGHT.get(d, 1) for d in over)
-    level = (4 if over and (over_w >= 3 or len(over) >= 3) else 3 if over
-             else 2 if n50 else 1 if n100 else 0)
+    level = (5 if over and (over_w >= 3 or len(over) >= 3) else 4 if over
+             else 3 if n50 else 2 if n100 else 1 if n_far else 0)
     ends = [p.end for p in plumes if p.end]
     sm = Smoke(level, sorted(over, key=lambda d: -DENSITY_WEIGHT.get(d, 1)), n50, n100,
-               near[0] if near else None, near[1] if near else 0.0, score, max(ends) if ends else None)
+               near[0] if near else None, near[1] if near else 0.0, score, max(ends) if ends else None,
+               n_far=n_far, far_mi=cfg.smoke_far_mi)
 
-    # Incoming: back-trajectories (next 12h) that start inside a plume.
+    # Incoming: back-trajectories (next watch_hours) that start inside a plume.
     for tr in sorted(trajs, key=lambda t: t.ts):
-        if tr.lead_h > 12 or tr.path_km < 10:
+        if tr.lead_h > cfg.watch_hours or tr.path_km < 10:
             continue
         inside = []
         for la, lo, _ in tr.origins:
@@ -965,6 +974,7 @@ def smoke_details(sm: Smoke) -> str:
         parts.append(f"overhead: {len(sm.overhead)} ({', '.join(sm.overhead)})")
     parts.append(f"within 50 mi: {sm.n50}")
     parts.append(f"50-100 mi: {sm.n100}")
+    parts.append(f"100-{sm.far_mi:.0f} mi: {sm.n_far}")
     if sm.nearest_km is not None and not sm.overhead:
         parts.append(f"nearest {sm.nearest_km / MI:.0f} mi {compass(sm.nearest_brg)}")
     parts.append(f"score {sm.score:.1f}")
@@ -980,6 +990,7 @@ def smoke_line(sm: Smoke) -> str:
     else:
         items.append(f"{sm.n50} {'plume' if sm.n50 == 1 else 'plumes'} within 50 mi")
     items.append(f"{sm.n100} at 50–100 mi")
+    items.append(f"{sm.n_far} at 100–{sm.far_mi:.0f} mi")
     items.append(f"score {sm.score:.1f}")
     return "Smoke: " + SEP.join(items)
 
@@ -994,17 +1005,18 @@ def decide_smoke(cfg: Config, st: Dict[str, float], sm: Smoke, a: Assessment,
         st.update(notified=sm.level, below_since=0)
         near = f"{sm.nearest_km / MI:.0f} mi {compass(sm.nearest_brg)}" if sm.nearest_km is not None else ""
         title = {
-            1: f"Smoke plume within 100 mi ({near})",
-            2: f"Smoke plume within 50 mi ({near})",
-            3: f"Smoke plume overhead ({', '.join(sm.overhead)})",
-            4: f"Dense smoke overhead ({len(sm.overhead)} plumes: {', '.join(sm.overhead)})",
+            1: f"Smoke plume within {cfg.smoke_far_mi:.0f} mi ({near})",
+            2: f"Smoke plume within 100 mi ({near})",
+            3: f"Smoke plume within 50 mi ({near})",
+            4: f"Smoke plume overhead ({', '.join(sm.overhead)})",
+            5: f"Dense smoke overhead ({len(sm.overhead)} plumes: {', '.join(sm.overhead)})",
         }[sm.level]
         arrive = ""
-        if sm.incoming_eta and sm.level < 3 and not st.get("incoming"):
+        if sm.incoming_eta and sm.level < 4 and not st.get("incoming"):
             st["incoming"] = 1
             arrive = f"May arrive: ~{clock(sm.incoming_eta, now)}"
         return Message(headline(title, a), _body(current_line(a), smoke_line(sm), arrive, sat, wind),
-                       {1: 2, 2: 3, 3: 3, 4: 4}[sm.level], "fog")
+                       {1: 2, 2: 3, 3: 3, 4: 3, 5: 4}[sm.level], "fog")
     if sm.level < notified:
         # Only step down after the lower level has held for a while: plumes jitter between analyses.
         if not st.get("below_since"):
@@ -1015,12 +1027,12 @@ def decide_smoke(cfg: Config, st: Dict[str, float], sm: Smoke, a: Assessment,
                 st["incoming"] = 0
                 return Message(headline("Smoke plumes cleared", a),
                                _body(current_line(a),
-                                     f"No satellite smoke plume within 100 mi for {cfg.smoke_clear_hours:g}h.",
+                                     f"No satellite smoke plume within {cfg.smoke_far_mi:.0f} mi for {cfg.smoke_clear_hours:g}h.",
                                      sat, wind),
                                2, "white_check_mark")
     else:
         st["below_since"] = 0
-    if sm.incoming_eta and not st.get("incoming") and sm.level < 3:
+    if sm.incoming_eta and not st.get("incoming") and sm.level < 4:
         st["incoming"] = 1
         return Message(
             headline(f"Smoke may arrive ~{clock(sm.incoming_eta, now)}", a),

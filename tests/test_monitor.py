@@ -240,18 +240,20 @@ class SmokeTest(unittest.TestCase):
 
     def test_levels(self):
         self.assertEqual(self.level([]).level, 0)
-        self.assertEqual(self.level([plume_at(180, 250)]).level, 0)
-        self.assertEqual(self.level([plume_at(180, 140)]).level, 1)   # edge ~75 mi
-        self.assertEqual(self.level([plume_at(180, 70)]).level, 2)    # edge ~31 mi
-        self.assertEqual(self.level([square(LAT, LON, 30)]).level, 3)
+        self.assertEqual(self.level([plume_at(180, 400)]).level, 0)   # edge ~236 mi
+        self.assertEqual(self.level([plume_at(180, 250)]).level, 1)   # edge ~143 mi
+        self.assertEqual(self.level([plume_at(180, 140)]).level, 2)   # edge ~75 mi
+        self.assertEqual(self.level([plume_at(180, 70)]).level, 3)    # edge ~31 mi
+        self.assertEqual(self.level([square(LAT, LON, 30)]).level, 4)
         dense = self.level([square(LAT, LON, 30, "medium"), square(LAT, LON, 50)])
-        self.assertEqual(dense.level, 4)
+        self.assertEqual(dense.level, 5)
         self.assertEqual(dense.overhead, ["medium", "light"])
-        self.assertEqual(self.level([square(LAT, LON, 30, "heavy")]).level, 4)
+        self.assertEqual(self.level([square(LAT, LON, 30, "heavy")]).level, 5)
+        self.assertEqual(m.assess_smoke(cfg(smoke_far_mi=100), [plume_at(180, 250)], []).level, 0)
 
     def test_overhead_plus_second_plume_nearby(self):
         sm = self.level([square(LAT, LON, 30), plume_at(270, 80)])
-        self.assertEqual(sm.level, 3)
+        self.assertEqual(sm.level, 4)
         self.assertEqual(sm.n50, 1)
         self.assertAlmostEqual(sm.score, 1.5)
 
@@ -260,13 +262,24 @@ class SmokeTest(unittest.TestCase):
         self.assertAlmostEqual(sm.nearest_km, 50, delta=2)
         self.assertEqual(m.compass(sm.nearest_brg), "S")
 
+    def test_slow_wind_far_plume_incoming_within_24h(self):
+        """A plume ~137 mi S on a 3 m/s south wind arrives in ~20h: past 12h, inside 24h."""
+        trajs = m.back_trajectories(cfg(), NOW, winds(3, 180), 24)
+        sm = self.level([plume_at(180, 320, half_km=100)], trajs)  # edge 220 km
+        self.assertEqual(sm.level, 1)
+        self.assertIsNotNone(sm.incoming_eta)
+        self.assertGreater((sm.incoming_eta - NOW) / H, 12)
+        msg = m.decide_smoke(cfg(), {}, sm, assessment(), NOW)
+        self.assertIn("within 200 mi", msg.title)
+        self.assertIn("May arrive", msg.body)
+
     def test_incoming_on_south_wind(self):
         trajs = m.back_trajectories(cfg(), NOW, winds(5, 180), 12)
         sm = self.level([plume_at(180, 150, half_km=40)], trajs)  # edge 110 km = 68 mi
-        self.assertEqual(sm.level, 1)
+        self.assertEqual(sm.level, 2)
         self.assertIsNotNone(sm.incoming_eta)
         self.assertAlmostEqual((sm.incoming_eta - NOW) / H, 110 / 18, delta=1.5)  # 5 m/s = 18 km/h
-        msg = m.decide_smoke(cfg(), {"notified": 1}, sm, assessment(), NOW)
+        msg = m.decide_smoke(cfg(), {"notified": 2}, sm, assessment(), NOW)
         self.assertTrue(msg.title.startswith("Smoke may arrive"))
         north = m.back_trajectories(cfg(), NOW, winds(5, 0), 12)
         self.assertIsNone(self.level([plume_at(180, 150, half_km=40)], north).incoming_eta)
@@ -318,7 +331,7 @@ class HmsParseTest(unittest.TestCase):
         plumes = m.parse_hms_zip(data)
         self.assertEqual([q.density for q in plumes], ["medium", "light"])
         self.assertEqual(plumes[0].end - plumes[0].start, 2 * H)
-        self.assertEqual(m.assess_smoke(cfg(), plumes, []).level, 3)
+        self.assertEqual(m.assess_smoke(cfg(), plumes, []).level, 4)
 
 
 class StateTest(unittest.TestCase):

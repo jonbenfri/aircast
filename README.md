@@ -40,17 +40,18 @@ Each poll (every 15 min by default):
 
    | Level | Meaning |
    |---|---|
-   | 0 | no plume within 100 mi |
-   | 1 | plume within 100 mi |
-   | 2 | plume within 50 mi |
-   | 3 | plume overhead |
-   | 4 | dense overhead: overlapping plumes (density weights ≥ 3) or a heavy plume |
+   | 0 | no plume within 200 mi (`AQI_SMOKE_FAR_MI`) |
+   | 1 | plume within 200 mi |
+   | 2 | plume within 100 mi |
+   | 3 | plume within 50 mi |
+   | 4 | plume overhead |
+   | 5 | dense overhead: overlapping plumes (density weights ≥ 3) or a heavy plume |
 
    Each alert lists plumes overhead, within 50 mi and within 50–100 mi, the nearest
    plume's distance and direction, and a score (overhead density weights +
-   0.5 × within 50 mi + 0.25 × within 100 mi; light = 1, medium = 2, heavy = 3).
+   0.5 × within 50 mi + 0.25 × within 100 mi + 0.125 × within 200 mi; light = 1, medium = 2, heavy = 3).
    It's flagged **incoming** when the back-trajectories start inside a plume
-   within the next 12 h.
+   within the next 24 h (`AQI_WATCH_HOURS`).
 9. **Alerts.** Fields within a line are separated by `  ||  `, and each alert shows when
    its readings were measured. Example:
 
