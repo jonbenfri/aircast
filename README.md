@@ -1,4 +1,8 @@
-# aqi-monitor
+# aircast
+
+Advanced air quality forecasting for one location: AQI threshold alerts that use
+live monitors, hourly wind trajectories and satellite smoke plumes, pushed to
+your phone through your own ntfy server.
 
 Forecasts when the US AQI near you will go above a threshold (default **35**)
 and sends a push notification to your phone through your own
@@ -73,7 +77,7 @@ Each poll (every 15 min by default):
 10. **Polling:** every 60 min when everything is clear, every 30 min when anything
     is brewing (any alert level, P ≥ 20%, AQI within 5 of the threshold, or any smoke).
 
-Run `.venv/bin/python aqi_monitor.py status` to see the hourly table it uses to decide.
+Run `.venv/bin/python aircast.py status` to see the hourly table it uses to decide.
 
 ### What it doesn't see
 
@@ -141,27 +145,27 @@ delayed.
 **6. Get the code onto the droplet** using a read-only deploy key:
 
 ```bash
-sudo ssh-keygen -t ed25519 -f /root/.ssh/aqi_deploy -N "" -C "droplet aqi-monitor deploy"
-sudo cat /root/.ssh/aqi_deploy.pub
+sudo ssh-keygen -t ed25519 -f /root/.ssh/aircast_deploy -N "" -C "droplet aircast deploy"
+sudo cat /root/.ssh/aircast_deploy.pub
 ```
 
 Add that key under the repo's Settings → Deploy keys. Leave write access off.
 
 ```bash
 sudo tee -a /root/.ssh/config <<'EOF'
-Host github-aqi
+Host github-aircast
     HostName github.com
     User git
-    IdentityFile /root/.ssh/aqi_deploy
+    IdentityFile /root/.ssh/aircast_deploy
     IdentitiesOnly yes
 EOF
-sudo git clone git@github-aqi:YOUR-GITHUB-USER/aqi-monitor.git /opt/aqi-monitor
+sudo git clone git@github-aircast:YOUR-GITHUB-USER/aircast.git /opt/aircast
 ```
 
 To update later:
 
 ```bash
-cd /opt/aqi-monitor && sudo git pull && sudo env UV_PYTHON_INSTALL_DIR=/opt/python uv sync && sudo systemctl restart aqi-monitor
+cd /opt/aircast && sudo git pull && sudo env UV_PYTHON_INSTALL_DIR=/opt/python uv sync && sudo systemctl restart aircast
 ```
 
 **7. Install the monitor.** It's a [uv](https://docs.astral.sh/uv/) project
@@ -171,7 +175,7 @@ third-party dependencies.
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin sh
-cd /opt/aqi-monitor
+cd /opt/aircast
 sudo env UV_PYTHON_INSTALL_DIR=/opt/python uv sync
 .venv/bin/python --version   # Python 3.12.x
 ```
@@ -180,19 +184,19 @@ sudo env UV_PYTHON_INSTALL_DIR=/opt/python uv sync
 where the `aqi` service user couldn't read it.
 
 ```bash
-cd /opt/aqi-monitor
+cd /opt/aircast
 sudo useradd --system --no-create-home aqi
-sudo mkdir -p /var/lib/aqi-monitor && sudo chown aqi:aqi /var/lib/aqi-monitor
-sudo cp deploy/aqi-monitor.env.example /etc/aqi-monitor.env && sudo chmod 600 /etc/aqi-monitor.env
-sudo nano /etc/aqi-monitor.env
+sudo mkdir -p /var/lib/aircast && sudo chown aqi:aqi /var/lib/aircast
+sudo cp deploy/aircast.env.example /etc/aircast.env && sudo chmod 600 /etc/aircast.env
+sudo nano /etc/aircast.env
 ```
 
 In the env file, set `NTFY_TOKEN` and `AIRNOW_API_KEY` (a free key from
 <https://docs.airnowapi.org/>).
 
 ```bash
-sudo cp deploy/aqi-monitor.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now aqi-monitor
+sudo cp deploy/aircast.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now aircast
 ```
 
 **Notification icon (optional).** Alerts can show `deploy/icons/aqi.png` as
@@ -201,19 +205,19 @@ their large icon. Add this block inside the ntfy `server { ... }` in
 
 ```nginx
 location /icons/ {
-    alias /opt/aqi-monitor/deploy/icons/;
+    alias /opt/aircast/deploy/icons/;
 }
 ```
 
 Then run `sudo nginx -t && sudo systemctl reload nginx` and set
-`NTFY_ICON=https://ntfy.example.com/icons/aqi.png` in `/etc/aqi-monitor.env`.
+`NTFY_ICON=https://ntfy.example.com/icons/aqi.png` in `/etc/aircast.env`.
 
 **8. Test:**
 
 ```bash
-sudo -u aqi env $(sudo grep -v '^#' /etc/aqi-monitor.env | xargs) /opt/aqi-monitor/.venv/bin/python /opt/aqi-monitor/aqi_monitor.py test-notify
-sudo -u aqi env $(sudo grep -v '^#' /etc/aqi-monitor.env | xargs) AQI_DB=/tmp/aqi.db python3 /opt/aqi-monitor/aqi_monitor.py status
-journalctl -u aqi-monitor -f
+sudo -u aqi env $(sudo grep -v '^#' /etc/aircast.env | xargs -d '\n') /opt/aircast/.venv/bin/python /opt/aircast/aircast.py test-notify
+sudo -u aqi env $(sudo grep -v '^#' /etc/aircast.env | xargs -d '\n') AQI_DB=/tmp/aircast-test.db /opt/aircast/.venv/bin/python /opt/aircast/aircast.py status
+journalctl -u aircast -f
 ```
 
 ## Tests

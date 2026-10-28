@@ -26,11 +26,19 @@ Ideas and open items, roughly in priority order.
 
 ## Many users
 - Same area: one monitor and topic, with a read-only ntfy account per subscriber.
-- A few areas: systemd template service (`aqi-monitor@.service`), one env file and topic per area.
+- A few areas: systemd template service (`aircast@.service`), one env file and topic per area.
 - Many areas: one process serving a list of areas, sharing AirNow downloads between nearby areas.
   Watch Open-Meteo's free tier: roughly 18 calls per area per check, about 10k calls a day.
 - Per-user location: either a fixed location the user sets, or the phone's location
   (e.g. OwnTracks posting to the server), mapped to the nearest area/topic.
+
+## VOC from low-cost outdoor monitors
+- AirGradient Open Air (Sensirion SGP41: VOC and NOx indices) and PurpleAir Flex/Zen (Bosch BME688).
+- Indices are relative to each sensor's own recent baseline, so they catch changes well but drift
+  back toward 100 during long smoke events: use as an early-warning layer, not a concentration.
+- Reject local noise (a neighbor's dryer vent, grills): require several sensors to rise together
+  (median, not mean), persistence over 2-3 readings, per-sensor robust z-scores, upwind sensors
+  rising first along the back-trajectories, and agreement with HMS smoke / PM2.5 / ozone.
 
 ## Forecasting
 - Replace the simple bias average with a proper Kalman filter (as in NOAA's KFAN).

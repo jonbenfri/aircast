@@ -1,17 +1,17 @@
 [Unit]
-Description=AQI forecast monitor (pushes alerts via ntfy)
+Description=aircast air quality forecasting (pushes alerts via ntfy)
 Wants=network-online.target
 After=network-online.target ntfy.service
 
 [Service]
 Type=simple
 User=aqi
-EnvironmentFile=/etc/aqi-monitor.env
-ExecStart=/opt/aqi-monitor/.venv/bin/python /opt/aqi-monitor/aqi_monitor.py run
+EnvironmentFile=/etc/aircast.env
+ExecStart=/opt/aircast/.venv/bin/python /opt/aircast/aircast.py run
 Restart=always
 RestartSec=30
 # Kept to options that old systemd (e.g. 229 on Ubuntu 16.04) understands.
-# /var/lib/aqi-monitor is created by hand (see README) since StateDirectory= needs systemd 235+.
+# /var/lib/aircast is created by hand (see README) since StateDirectory= needs systemd 235+.
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true

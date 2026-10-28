@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AQI monitor: forecasts when US AQI near you will exceed a threshold and
+"""aircast: air quality forecasting. Forecasts when US AQI near you will exceed a threshold and
 pushes alerts to your phone through an ntfy server.
 
 Data:
@@ -47,7 +47,7 @@ Smoke (NOAA HMS satellite smoke polygons, no key): a separate state:
   monitors don't measure smoke VOCs, so this is tracked separately.
 
 Stdlib only (Python 3.8+). Configured through environment variables; see
-deploy/aqi-monitor.env.example.
+deploy/aircast.env.example.
 """
 from __future__ import annotations
 
@@ -69,7 +69,7 @@ import zipfile
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-log = logging.getLogger("aqi-monitor")
+log = logging.getLogger("aircast")
 
 OPEN_METEO_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 OPEN_METEO_WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
@@ -129,7 +129,7 @@ class Config:
     ntfy_token: Optional[str] = None
     ntfy_icon: Optional[str] = None
     place: Optional[str] = None
-    db_path: str = "aqi-monitor.db"
+    db_path: str = "aircast.db"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -172,7 +172,7 @@ class Config:
             ntfy_token=_env("NTFY_TOKEN"),
             ntfy_icon=_env("NTFY_ICON"),
             place=_env("AQI_PLACE"),
-            db_path=_env("AQI_DB", "aqi-monitor.db"),
+            db_path=_env("AQI_DB", "aircast.db"),
         )
 
 
@@ -180,7 +180,7 @@ class Config:
 
 def _get_json(url: str, params: Dict[str, object], timeout: float = 20):
     full = url + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(full, headers={"User-Agent": "aqi-monitor/1.0"})
+    req = urllib.request.Request(full, headers={"User-Agent": "aircast/1.0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)
 
@@ -847,7 +847,7 @@ def fetch_hms(cfg: Config, now: float) -> List[Plume]:
         for pat in patterns:
             url = time.strftime(pat, t)
             try:
-                req = urllib.request.Request(url, headers={"User-Agent": "aqi-monitor/1.0"})
+                req = urllib.request.Request(url, headers={"User-Agent": "aircast/1.0"})
                 with urllib.request.urlopen(req, timeout=60) as r:
                     plumes += parse_hms_zip(r.read())
                 found = True
@@ -1335,14 +1335,14 @@ def run_forever(cfg: Config, store: Store) -> None:
             if not is_bad(cfg, store.get("level", CLEAR), a):
                 minutes = cfg.poll_good_minutes
             if failures >= cfg.fail_alert_after:
-                notify(cfg, Message("AQI monitor recovered", "Data fetches are working again.", 2, "white_check_mark"))
+                notify(cfg, Message("aircast recovered", "Data fetches are working again.", 2, "white_check_mark"))
             failures = 0
         except Exception as e:
             failures += 1
             log.error("tick failed (%d in a row): %s", failures, e)
             if failures == cfg.fail_alert_after:
                 try:
-                    notify(cfg, Message("AQI monitor can't get data",
+                    notify(cfg, Message("aircast can't get data",
                                         f"{failures} failed fetches in a row. Last error: {e}", 3, "x"))
                 except Exception as ne:
                     log.error("notify failed: %s", ne)
@@ -1388,7 +1388,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     cfg = Config.from_env()
 
     if args.command == "test-notify":
-        notify(cfg, Message("AQI monitor test", "If you see this, push notifications work.", 3, "test_tube"))
+        notify(cfg, Message("aircast test", "If you see this, push notifications work.", 3, "test_tube"))
         return
     store = Store(cfg.db_path)
     if args.command == "run":

@@ -1,7 +1,7 @@
 [project]
-name = "aqi-monitor"
+name = "aircast"
 version = "0.1.0"
-description = "Forecasts when US AQI near you will exceed a threshold and pushes alerts via ntfy"
+description = "Air quality forecasting: AQI threshold alerts using wind trajectories, upwind monitors and satellite smoke, pushed via ntfy"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []

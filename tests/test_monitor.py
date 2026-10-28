@@ -4,7 +4,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import aqi_monitor as m  # noqa: E402
+import aircast as m  # noqa: E402
 
 H = m.HOUR
 NOW = 1_761_600_000 // H * H + 600  # 10 min past an hour
