@@ -10,7 +10,9 @@ Ideas and open items, roughly in priority order.
 ## Alerts
 - A different notification icon for each alert type (watch / forecast / now / clear / error).
 - Include AirNow's official forecast and any agency advisory in alerts (AirNow data-use guidelines).
-- Add NOAA HMS satellite smoke polygons (what fire.airnow.gov shows) as an early-warning signal.
+- ~~NOAA HMS satellite smoke polygons~~ (done: smoke levels 0-4 and "incoming").
+- Fire detections (NASA FIRMS, free MAP_KEY) to say which fire a plume comes from.
+- Smoke forecasts (NOAA HRRR-Smoke) for near-surface smoke, not just the satellite column.
 
 ## Smoke map for your area
 - A local version of the fire.airnow.gov view, centered on your location (~150-300 mi), with:

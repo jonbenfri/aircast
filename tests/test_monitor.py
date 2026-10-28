@@ -160,11 +160,13 @@ class WatchTest(unittest.TestCase):
         self.assertTrue(a.threats)
         self.assertIsNotNone(msg)
 
-    def test_model_far_ring_without_airnow(self):
-        far = {b: flat(15) for b in m.RING_BEARINGS}
-        far[180] = flat(60)
-        a = m.assess(cfg(), flat(15), [], None, NOW, m.Wind(5, 180), winds(5, 180), None, [], far)
+    def test_model_origin_without_airnow(self):
+        trajs = m.back_trajectories(cfg(), NOW, winds(5, 180), 24)
+        origin_model = {tr.ts: (60.0 if tr.lead_h >= 6 else 15.0) for tr in trajs}
+        a = m.assess(cfg(), flat(15), [], None, NOW, m.Wind(5, 180), winds(5, 180), None, [],
+                     trajs, origin_model)
         self.assertEqual(a.threats[0].name, "model")
+        self.assertEqual(m.compass(a.threats[0].bearing), "S")
 
     def test_watch_clears_when_wind_turns(self):
         a, _ = self.run_case(m.Wind(5, 0), winds(5, 0))
@@ -176,6 +178,130 @@ class WatchTest(unittest.TestCase):
         quiet, _ = self.run_case(m.Wind(5, 0), winds(5, 0))
         self.assertFalse(m.is_bad(cfg(), m.CLEAR, quiet))
         self.assertTrue(m.is_bad(cfg(), m.WATCH, quiet))
+
+
+class TrajectoryTest(unittest.TestCase):
+    def test_constant_wind(self):
+        trajs = m.back_trajectories(cfg(), NOW, winds(5, 180), 6)
+        tr = next(t for t in trajs if round(t.lead_h) == 4)
+        e, n = m.local_km(LAT, LON, *tr.origins[0][:2])
+        self.assertAlmostEqual(n, -5 * 3.6 * tr.lead_h, delta=1)  # air came from the south
+        self.assertAlmostEqual(e, 0, delta=1)
+        self.assertEqual(len(tr.origins), len(m.SCENARIOS))
+
+    def test_spike_is_not_smoothed_away(self):
+        """A 3h burst of strong south wind moves air far; averaging with calm hours would not show where."""
+        base = NOW // H * H
+        hourly = {base + h * H: m.Wind(12 if 1 <= h <= 3 else 1, 180 if 1 <= h <= 3 else 90)
+                  for h in range(-24, 49)}
+        tr = next(t for t in m.back_trajectories(cfg(), NOW, hourly, 6) if round(t.lead_h) == 5)
+        e, n = m.local_km(LAT, LON, *tr.origins[0][:2])
+        self.assertLess(n, -100)       # most of the trip was the southerly burst
+        self.assertLess(abs(e), 20)    # the light easterly hours barely matter
+
+    def test_scenarios_spread(self):
+        tr = next(t for t in m.back_trajectories(cfg(), NOW, winds(5, 180), 12) if round(t.lead_h) == 10)
+        lons = [o[1] for o in tr.origins]
+        self.assertGreater(max(lons) - min(lons), 0.5)  # +/-20 deg fans out
+
+
+def square(lat, lon, half_km, density="light"):
+    dlat, dlon = half_km / 110.57, half_km / (111.32 * math.cos(math.radians(lat)))
+    ring = [(lon - dlon, lat - dlat), (lon - dlon, lat + dlat), (lon + dlon, lat + dlat),
+            (lon + dlon, lat - dlat), (lon - dlon, lat - dlat)]
+    return m.Plume(density, None, NOW, [ring], (lon - dlon, lat - dlat, lon + dlon, lat + dlat))
+
+
+def plume_at(bearing, km, half_km=20, density="light"):
+    la, lo = m.destination(LAT, LON, bearing, km)
+    return square(la, lo, half_km, density)
+
+
+class SmokeTest(unittest.TestCase):
+    def level(self, plumes, trajs=()):
+        return m.assess_smoke(cfg(), plumes, list(trajs))
+
+    def test_levels(self):
+        self.assertEqual(self.level([]).level, 0)
+        self.assertEqual(self.level([plume_at(180, 250)]).level, 0)
+        self.assertEqual(self.level([plume_at(180, 140)]).level, 1)   # edge ~75 mi
+        self.assertEqual(self.level([plume_at(180, 70)]).level, 2)    # edge ~31 mi
+        self.assertEqual(self.level([square(LAT, LON, 30)]).level, 3)
+        dense = self.level([square(LAT, LON, 30, "medium"), square(LAT, LON, 50)])
+        self.assertEqual(dense.level, 4)
+        self.assertEqual(dense.overhead, ["medium", "light"])
+        self.assertEqual(self.level([square(LAT, LON, 30, "heavy")]).level, 4)
+
+    def test_overhead_plus_second_plume_nearby(self):
+        sm = self.level([square(LAT, LON, 30), plume_at(270, 80)])
+        self.assertEqual(sm.level, 3)
+        self.assertEqual(sm.n50, 1)
+        self.assertAlmostEqual(sm.score, 1.5)
+
+    def test_nearest_distance_and_direction(self):
+        sm = self.level([plume_at(180, 70)])
+        self.assertAlmostEqual(sm.nearest_km, 50, delta=2)
+        self.assertEqual(m.compass(sm.nearest_brg), "S")
+
+    def test_incoming_on_south_wind(self):
+        trajs = m.back_trajectories(cfg(), NOW, winds(5, 180), 12)
+        sm = self.level([plume_at(180, 150, half_km=40)], trajs)  # edge 110 km = 68 mi
+        self.assertEqual(sm.level, 1)
+        self.assertIsNotNone(sm.incoming_eta)
+        self.assertAlmostEqual((sm.incoming_eta - NOW) / H, 110 / 18, delta=1.5)  # 5 m/s = 18 km/h
+        msg = m.decide_smoke(cfg(), {"notified": 1}, sm, 20, NOW)
+        self.assertTrue(msg.title.startswith("Smoke may arrive"))
+        north = m.back_trajectories(cfg(), NOW, winds(5, 0), 12)
+        self.assertIsNone(self.level([plume_at(180, 150, half_km=40)], north).incoming_eta)
+
+    def test_alert_flow(self):
+        c, st = cfg(), {}
+        msg = m.decide_smoke(c, st, self.level([plume_at(180, 70)]), 20, NOW)
+        self.assertIn("within 50 mi", msg.title)
+        self.assertIsNone(m.decide_smoke(c, st, self.level([plume_at(180, 140)]), 20, NOW + H))  # step down: quiet
+        self.assertIsNone(m.decide_smoke(c, st, self.level([plume_at(180, 70)]), 20, NOW + 2 * H))  # back up: no repeat
+        msg = m.decide_smoke(c, st, self.level([square(LAT, LON, 30)]), 20, NOW + 3 * H)
+        self.assertIn("overhead", msg.title)
+        self.assertIsNone(m.decide_smoke(c, st, self.level([]), 20, NOW + 4 * H))
+        msg = m.decide_smoke(c, st, self.level([]), 20, NOW + 8 * H)
+        self.assertEqual(msg.title, "Smoke plumes cleared")
+        self.assertEqual(st["notified"], 0)
+
+
+def _shapefile_zip(polys):
+    """Minimal ESRI shapefile (.shp + .dbf) with Density/Start/End fields, zipped like HMS."""
+    import io as _io, struct as _st, zipfile as _zf
+    recs = b""
+    for n, (ring, _) in enumerate(polys, 1):
+        xs, ys = [p[0] for p in ring], [p[1] for p in ring]
+        c = _st.pack("<i4d2i", 5, min(xs), min(ys), max(xs), max(ys), 1, len(ring)) + _st.pack("<i", 0)
+        c += b"".join(_st.pack("<2d", *p) for p in ring)
+        recs += _st.pack(">2i", n, len(c) // 2) + c
+    shp = _st.pack(">i", 9994) + b"\0" * 20 + _st.pack(">i", (100 + len(recs)) // 2) + _st.pack("<2i", 1000, 5)
+    shp += b"\0" * (100 - len(shp)) + recs
+    fields = [("Satellite", 10), ("Start", 12), ("End", 12), ("Density", 6)]
+    rlen = 1 + sum(l for _, l in fields)
+    hdr = _st.pack("<4BIHH", 3, 126, 1, 1, len(polys), 32 + 32 * len(fields) + 1, rlen) + b"\0" * 20
+    for name, l in fields:
+        hdr += name.encode().ljust(11, b"\0") + b"C" + b"\0" * 4 + bytes([l, 0]) + b"\0" * 14
+    hdr += b"\r"
+    body = b"".join(b" " + b"".join(v.encode().ljust(l) for v, (_, l) in zip(
+        ["GOES-EAST", "2026301 1500", "2026301 1700", dens], fields)) for _, dens in polys)
+    buf = _io.BytesIO()
+    with _zf.ZipFile(buf, "w") as z:
+        z.writestr("hms_smoke20261028.shp", shp)
+        z.writestr("hms_smoke20261028.dbf", hdr + body + b"\x1a")
+    return buf.getvalue()
+
+
+class HmsParseTest(unittest.TestCase):
+    def test_roundtrip(self):
+        p = square(LAT, LON, 30)
+        data = _shapefile_zip([(p.rings[0], "Medium"), (plume_at(180, 70).rings[0], "Light")])
+        plumes = m.parse_hms_zip(data)
+        self.assertEqual([q.density for q in plumes], ["medium", "light"])
+        self.assertEqual(plumes[0].end - plumes[0].start, 2 * H)
+        self.assertEqual(m.assess_smoke(cfg(), plumes, []).level, 3)
 
 
 class StateTest(unittest.TestCase):

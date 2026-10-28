@@ -27,13 +27,24 @@ Wind (Open-Meteo weather forecast, current + hourly 10 m wind):
   by ~3 m/s. Calm air (< 2 m/s) adds a stagnation term to sigma because
   pollution tends to accumulate locally.
 
-Upwind monitors (AirNow, needs key): models often miss wildfire smoke, so
-  real stations within ~150 km also count. For forecast hour h we average the
-  wind vector from now to h, keep stations inside the upwind cone, and weight
-  each by alignment and by how closely its travel time (distance / speed)
-  matches h. Assuming the plume persists, their current readings say what
-  arrives at h:
-    corrected(h) += obs_weight * confidence * w(speed) * (upwind_obs(h) - corrected(h))
+Transport (forecast winds, hour by hour, no smoothing):
+  Air arriving at hour h is traced backwards through the hourly forecast
+  winds (a back-trajectory), so spikes and wind shifts count where they
+  happen instead of being averaged away. Transport wind is the vector mean
+  of the 10 m and 850 hPa winds (a rough mixed-layer wind). Five scenarios
+  are traced: the forecast as-is, direction +/-20 deg, speed x0.7 and x1.3.
+  Where they disagree, uncertainty goes up.
+
+Upwind monitors (AirNow, needs key): models often miss wildfire smoke. For
+  each hour h, monitors near each scenario's starting point say what air
+  is on its way, assuming the plume persists:
+    corrected(h) += obs_weight * agreement * (upwind_obs(h) - corrected(h))
+
+Smoke (NOAA HMS satellite smoke polygons, no key): a separate state:
+  0 none within 100 mi, 1 within 100 mi, 2 within 50 mi, 3 overhead,
+  4 dense overhead (overlapping plumes or medium/heavy density), plus an
+  "incoming" flag when the back-trajectories start inside a plume. AQI
+  monitors don't measure smoke VOCs, so this is tracked separately.
 
 Stdlib only (Python 3.8+). Configured through environment variables; see
 deploy/aqi-monitor.env.example.
@@ -41,15 +52,20 @@ deploy/aqi-monitor.env.example.
 from __future__ import annotations
 
 import argparse
+import calendar
+import io
 import json
 import logging
 import math
 import os
+import struct
 import sqlite3
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -60,6 +76,13 @@ OPEN_METEO_WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 # The old /aq/observation/latLong/current/ was retired 2026-09-30 (HTTP 410).
 AIRNOW_URL = "https://www.airnowapi.org/aq/observation/current/ziplatlong/"
 AIRNOW_DATA_URL = "https://www.airnowapi.org/aq/data/"
+# NOAA Hazard Mapping System smoke polygons, one zip per UTC day (strftime patterns, tried in order).
+HMS_URLS = [
+    "https://satepsanone.nesdis.noaa.gov/pub/FIRE/web/HMS/Smoke_Polygons/Shapefile/%Y/%m/hms_smoke%Y%m%d.zip",
+    "https://satepsanone.nesdis.noaa.gov/pub/FIRE/web/HMS/Smoke_Polygons/Shapefile/%Y/hms_smoke%Y%m%d.zip",
+]
+MPH = 2.23694  # m/s -> mph
+MI = 1.609344  # km per mile
 HOUR = 3600
 
 
@@ -91,9 +114,13 @@ class Config:
     wind_weight: float = 0.35
     stagnant_ms: float = 2.0
     stagnant_sigma: float = 5.0
-    upwind_km: float = 170.0
+    upwind_km: float = 250.0
     watch_aqi: Optional[float] = None
-    watch_cone_deg: float = 45.0
+    watch_hours: int = 24
+    transport: str = "mixed"
+    smoke: bool = True
+    hms_url: Optional[str] = None
+    smoke_clear_hours: float = 3.0
     obs_weight: float = 0.6
     airnow_key: Optional[str] = None
     airnow_distance: int = 25
@@ -129,9 +156,13 @@ class Config:
             wind_weight=f("AQI_WIND_WEIGHT", 0.35),
             stagnant_ms=f("AQI_STAGNANT_MS", 2.0),
             stagnant_sigma=f("AQI_STAGNANT_SIGMA", 5),
-            upwind_km=f("AQI_UPWIND_KM", 170),
+            upwind_km=f("AQI_UPWIND_KM", 250),
             watch_aqi=float(_env("AQI_WATCH_AQI")) if _env("AQI_WATCH_AQI") else None,
-            watch_cone_deg=f("AQI_WATCH_CONE_DEG", 45),
+            watch_hours=int(f("AQI_WATCH_HOURS", 24)),
+            transport=_env("AQI_TRANSPORT", "mixed"),
+            smoke=_env("AQI_SMOKE", "1") not in ("0", "false", "no"),
+            hms_url=_env("AQI_HMS_URL"),
+            smoke_clear_hours=f("AQI_SMOKE_CLEAR_HOURS", 3),
             obs_weight=f("AQI_OBS_WEIGHT", 0.6),
             airnow_key=_env("AIRNOW_API_KEY"),
             airnow_distance=int(f("AIRNOW_DISTANCE_MILES", 25)),
@@ -201,29 +232,66 @@ def fetch_ring(cfg: Config, km: float) -> Dict[int, List[Tuple[int, float]]]:
 class Wind:
     speed: float      # m/s
     direction: float  # degrees the wind blows FROM (meteorological)
+    gust: Optional[float] = None
 
 
-def fetch_wind(cfg: Config) -> Tuple[Optional[Wind], Dict[int, Wind]]:
-    """(current wind, hourly wind keyed by unix ts) at your location."""
-    data = _get_json(OPEN_METEO_WEATHER_URL, {
+def _winds(h: dict, speed: str, direction: str, gust: Optional[str] = None) -> Dict[int, Wind]:
+    if speed not in h or direction not in h:
+        return {}
+    gusts = h.get(gust) if gust else None
+    out = {}
+    for i, (t, sp, d) in enumerate(zip(h["time"], h[speed], h[direction])):
+        if sp is not None and d is not None:
+            g = gusts[i] if gusts and gusts[i] is not None else None
+            out[int(t)] = Wind(float(sp), float(d), g)
+    return out
+
+
+def fetch_wind(cfg: Config) -> Tuple[Optional[Wind], Dict[int, Wind], Dict[int, Wind]]:
+    """(current 10 m wind, hourly 10 m wind, hourly transport wind), keyed by unix ts."""
+    hourly = ["wind_speed_10m", "wind_direction_10m", "wind_gusts_10m"]
+    if cfg.transport == "mixed":
+        hourly += ["wind_speed_850hPa", "wind_direction_850hPa"]
+    params = {
         "latitude": cfg.lat,
         "longitude": cfg.lon,
         "current": "wind_speed_10m,wind_direction_10m",
-        "hourly": "wind_speed_10m,wind_direction_10m",
         "wind_speed_unit": "ms",
         "past_days": 1,
         "forecast_days": 3,
         "timeformat": "unixtime",
-    })
+    }
+    try:
+        data = _get_json(OPEN_METEO_WEATHER_URL, dict(params, hourly=",".join(hourly)))
+    except urllib.error.HTTPError as e:
+        if cfg.transport != "mixed":
+            raise
+        log.warning("850 hPa wind unavailable (%s); using 10 m wind for transport", e)
+        data = _get_json(OPEN_METEO_WEATHER_URL, dict(params, hourly=",".join(hourly[:3])))
     h = data["hourly"]
-    hourly = {int(t): Wind(float(s), float(d))
-              for t, s, d in zip(h["time"], h["wind_speed_10m"], h["wind_direction_10m"])
-              if s is not None and d is not None}
+    surface = _winds(h, "wind_speed_10m", "wind_direction_10m", "wind_gusts_10m")
+    aloft = _winds(h, "wind_speed_850hPa", "wind_direction_850hPa")
+    transport = {t: (mean_wind([w, aloft[t]]) if t in aloft else w) for t, w in surface.items()}
     c = data.get("current") or {}
     cur = None
     if c.get("wind_speed_10m") is not None and c.get("wind_direction_10m") is not None:
         cur = Wind(float(c["wind_speed_10m"]), float(c["wind_direction_10m"]))
-    return cur, hourly
+    return cur, surface, transport
+
+
+def fetch_points(cfg: Config, pts: List[Tuple[float, float]]) -> List[List[Tuple[int, float]]]:
+    """Model AQI series at arbitrary points. One request."""
+    data = _get_json(OPEN_METEO_URL, {
+        "latitude": ",".join(f"{la:.4f}" for la, _ in pts),
+        "longitude": ",".join(f"{lo:.4f}" for _, lo in pts),
+        "hourly": "us_aqi",
+        "past_days": 1,
+        "forecast_days": 1,
+        "timeformat": "unixtime",
+    })
+    if isinstance(data, dict):
+        data = [data]
+    return [_parse_series(d["hourly"], "us_aqi") for d in data]
 
 
 def fetch_observation(cfg: Config) -> Optional[Tuple[int, float, str]]:
@@ -392,84 +460,143 @@ def mean_wind(winds: List[Wind]) -> Optional[Wind]:
     return Wind(math.hypot(u, v), math.degrees(math.atan2(-u, -v)) % 360)
 
 
-def upwind_obs(stations: List[Station], lat: float, lon: float, wind: Wind,
-               lead_h: float) -> Optional[Tuple[float, float]]:
-    """(AQI the upwind stations imply arrives at lead_h, confidence 0..1) or None."""
-    if wind.speed < 0.5:
-        return None
-    num = den = 0.0
-    width = 1.0 + 0.25 * lead_h  # timing gets fuzzier further out
-    for st in stations:
-        km, brg = distance_bearing(lat, lon, st.lat, st.lon)
-        if km < 5:  # that's essentially "here", handled as the current observation
+def local_km(lat0: float, lon0: float, lat: float, lon: float) -> Tuple[float, float]:
+    """(east, north) km of a point relative to (lat0, lon0); fine within a few hundred km."""
+    return ((lon - lon0) * 111.32 * math.cos(math.radians(lat0)), (lat - lat0) * 110.57)
+
+
+def offset_latlon(lat: float, lon: float, east_km: float, north_km: float) -> Tuple[float, float]:
+    return lat + north_km / 110.57, lon + east_km / (111.32 * math.cos(math.radians(lat)))
+
+
+def _uv(w: Wind) -> Tuple[float, float]:
+    """Air motion (east, north) in m/s; direction is where the wind comes FROM."""
+    r = math.radians(w.direction)
+    return -w.speed * math.sin(r), -w.speed * math.cos(r)
+
+
+# Wind scenarios: (direction offset deg, speed factor). Member 0 is the forecast as-is.
+SCENARIOS = [(0.0, 1.0), (-20.0, 1.0), (20.0, 1.0), (0.0, 0.7), (0.0, 1.3)]
+
+
+@dataclass
+class Trajectory:
+    """Where the air arriving at `ts` is right now, under each wind scenario."""
+    ts: int
+    lead_h: float
+    origins: List[Tuple[float, float, float]]  # (lat, lon, path_km) per scenario
+
+    @property
+    def path_km(self) -> float:
+        return self.origins[0][2]
+
+
+def back_trajectories(cfg: Config, now: float, transport: Dict[int, Wind],
+                      hours: float, step_s: float = 600) -> List[Trajectory]:
+    """Trace each arriving hour back to `now` through the hourly winds (uniform-field approximation)."""
+    series = sorted((t, *_uv(w)) for t, w in transport.items())
+    if len(series) < 2:
+        return []
+    times = [t for t, _, _ in series]
+
+    def uv_at(t: float) -> Tuple[float, float]:
+        if t <= times[0]:
+            return series[0][1], series[0][2]
+        if t >= times[-1]:
+            return series[-1][1], series[-1][2]
+        i = max(k for k in range(len(times)) if times[k] <= t)
+        (t0, u0, v0), (t1, u1, v1) = series[i], series[i + 1]
+        f = (t - t0) / (t1 - t0)
+        return u0 + (u1 - u0) * f, v0 + (v1 - v0) * f
+
+    out = []
+    for ts in times:
+        if ts <= now or ts > now + hours * HOUR:
             continue
-        off = abs((brg - wind.direction + 180) % 360 - 180)
-        if off >= 60:
-            continue
-        align = math.cos(math.radians(off * 1.5))  # 1 dead upwind, 0 at 60 deg off
-        travel_h = km / (wind.speed * 3.6)
-        timing = math.exp(-0.5 * ((travel_h - lead_h) / width) ** 2)
-        w = align * timing
-        num += w * st.aqi
-        den += w
-    if den < 0.05:
+        origins = []
+        for rot, fac in SCENARIOS:
+            c, s_ = math.cos(math.radians(rot)), math.sin(math.radians(rot))
+            e = n = path = 0.0
+            t = float(ts)
+            while t > now:
+                dt = min(step_s, t - now)
+                u, v = uv_at(t - dt / 2)
+                u, v = (u * c + v * s_) * fac, (v * c - u * s_) * fac
+                e -= u * dt / 1000
+                n -= v * dt / 1000
+                path += math.hypot(u, v) * dt / 1000
+                t -= dt
+            origins.append((*offset_latlon(cfg.lat, cfg.lon, e, n), path))
+        out.append(Trajectory(ts, (ts - now) / HOUR, origins))
+    return out
+
+
+def traj_obs(stations: List[Station], tr: Trajectory) -> Optional[Tuple[float, float, float]]:
+    """(AQI arriving at tr.ts, spread across scenarios, agreement 0..1) from monitors near the origins."""
+    ests, support = [], 0.0
+    for la, lo, path in tr.origins:
+        sig = 10 + 0.15 * path  # starting-point uncertainty grows with distance travelled
+        num = den = 0.0
+        for st in stations:
+            e, n = local_km(la, lo, st.lat, st.lon)
+            d = math.hypot(e, n)
+            if d < 3 * sig:
+                w = math.exp(-0.5 * (d / sig) ** 2)
+                num += w * st.aqi
+                den += w
+        if den > 0.05:
+            ests.append(num / den)
+            support += min(1.0, den)
+    if not ests:
         return None
-    return num / den, min(1.0, den)
+    mean = sum(ests) / len(ests)
+    spread = math.sqrt(sum((x - mean) ** 2 for x in ests) / len(ests))
+    return mean, spread, support / len(tr.origins)
 
 
 @dataclass
 class Threat:
-    """Bad air upwind that the current or forecast wind points at you."""
+    """Bad air that forecast winds are expected to carry to you."""
     aqi: float
     name: str
     km: float
     bearing: float
-    wind: Wind
     eta: int
+    support: float  # fraction of wind scenarios that bring it
 
 
-def find_threats(cfg: Config, now: float, stations: List[Station],
-                 far_ring: Optional[Dict[int, List[Tuple[int, float]]]],
-                 wind_now: Optional[Wind], wind_hourly: Optional[Dict[int, Wind]],
-                 max_travel_h: float = 36.0) -> List[Threat]:
-    """Upwind monitors (or model ring points) above watch_aqi, worst first.
-
-    Checked against the current wind and the mean forecast wind over the next
-    6h, so a wind that is about to turn toward you also counts.
-    """
+def find_threats(cfg: Config, stations: List[Station], trajs: List[Trajectory],
+                 origin_model: Optional[Dict[int, float]] = None) -> List[Threat]:
+    """Monitors (or model points) above watch_aqi that the back-trajectories start near, worst first."""
     limit = cfg.threshold if cfg.watch_aqi is None else cfg.watch_aqi
-    winds = [wind_now] if wind_now else []
-    nxt = mean_wind([v for t, v in sorted((wind_hourly or {}).items()) if now < t <= now + 6 * HOUR])
-    if nxt:
-        winds.append(nxt)
+    hits: Dict[str, Dict] = {}
 
-    cands: List[Tuple[float, str, float, float]] = []  # aqi, name, km, bearing
-    for st in stations:
-        km, brg = distance_bearing(cfg.lat, cfg.lon, st.lat, st.lon)
-        if 5 <= km <= cfg.upwind_km:
-            cands.append((st.aqi, st.name, km, brg))
-    for brg, series in (far_ring or {}).items():
-        v = interp(series, now)
-        if v is not None:
-            cands.append((v, "model", cfg.upwind_km, float(brg)))
+    def hit(key, aqi, name, lat, lon, ts, member):
+        km, brg = distance_bearing(cfg.lat, cfg.lon, lat, lon)
+        h = hits.setdefault(key, {"aqi": aqi, "name": name, "km": km, "brg": brg,
+                                  "eta": None, "eta_any": ts, "members": set()})
+        h["members"].add(member)
+        h["eta_any"] = min(h["eta_any"], ts)
+        if member == 0 and (h["eta"] is None or ts < h["eta"]):
+            h["eta"] = ts
 
-    best: Dict[str, Threat] = {}
-    for aqi, name, km, brg in cands:
-        if aqi <= limit:
-            continue
-        for w in winds:
-            if w.speed < 1.0:
+    for tr in trajs:
+        for i, (la, lo, path) in enumerate(tr.origins):
+            if path < 10:  # air that hasn't moved is "here", covered by the current reading
                 continue
-            if abs((brg - w.direction + 180) % 360 - 180) > cfg.watch_cone_deg:
-                continue
-            travel_h = km / (w.speed * 3.6)
-            if travel_h > max_travel_h:
-                continue
-            t = Threat(aqi, name, km, brg, w, int(now + travel_h * HOUR))
-            key = f"{name}@{brg:.0f}"
-            if key not in best or t.eta < best[key].eta:
-                best[key] = t
-    return sorted(best.values(), key=lambda t: -t.aqi)
+            r = 15 + 0.15 * path
+            for st in stations:
+                if st.aqi > limit and math.hypot(*local_km(la, lo, st.lat, st.lon)) <= r:
+                    hit(f"{st.lat:.3f},{st.lon:.3f}", st.aqi, st.name, st.lat, st.lon, tr.ts, i)
+        v = (origin_model or {}).get(tr.ts)
+        la, lo, path = tr.origins[0]
+        if v is not None and v > limit and path >= 30:
+            _, brg = distance_bearing(cfg.lat, cfg.lon, la, lo)
+            hit(f"model@{compass(brg)}", v, "model", la, lo, tr.ts, 0)
+
+    out = [Threat(h["aqi"], h["name"], h["km"], h["brg"], h["eta"] or h["eta_any"],
+                  len(h["members"]) / len(SCENARIOS)) for h in hits.values()]
+    return sorted(out, key=lambda t: -t.aqi * t.support)
 
 
 def wind_weight(speed: float, max_weight: float) -> float:
@@ -492,6 +619,7 @@ class HourForecast:
     p_exceed: float
     wind: Optional[Wind] = None
     upwind: Optional[float] = None
+    traj: Optional[Trajectory] = None
 
 
 @dataclass
@@ -505,6 +633,9 @@ class Assessment:
     upwind_now: Optional[float] = None
     hours: List[HourForecast] = field(default_factory=list)
     threats: List[Threat] = field(default_factory=list)
+    surface: Dict[int, Wind] = field(default_factory=dict)
+    trajs: List[Trajectory] = field(default_factory=list)
+    smoke: Optional["Smoke"] = None
 
     @property
     def max_p(self) -> float:
@@ -523,26 +654,35 @@ def assess(cfg: Config, model: List[Tuple[int, float]], residuals: List[Tuple[in
            wind_now: Optional[Wind] = None, wind_hourly: Optional[Dict[int, Wind]] = None,
            ring: Optional[Dict[int, List[Tuple[int, float]]]] = None,
            stations: Optional[List[Station]] = None,
-           far_ring: Optional[Dict[int, List[Tuple[int, float]]]] = None) -> Assessment:
+           trajs: Optional[List[Trajectory]] = None,
+           origin_model: Optional[Dict[int, float]] = None,
+           plumes: Optional[List["Plume"]] = None) -> Assessment:
+    """wind_hourly is the 10 m wind; trajs default to tracing it if not given."""
     bias = estimate_bias(residuals, now)
     sigma0 = estimate_sigma0(residuals, cfg.sigma0)
     model_now = interp(model, now)
     if model_now is None:
         raise ValueError("model series does not cover the current time")
     if observation is not None:
-        current, source = observation[1], f"AirNow, preliminary, {observation[2]}"
+        current, source = observation[1], f"AirNow, {observation[2]}"
     else:
         current, source = model_now + bias, "model"
 
+    if trajs is None:
+        trajs = back_trajectories(cfg, now, wind_hourly or {}, max(cfg.watch_hours, cfg.horizon_hours))
+    by_ts = {tr.ts: tr for tr in trajs}
     a = Assessment(now=int(now), current=current, current_source=source, bias=bias,
-                   sigma0=sigma0, wind_now=wind_now)
-    a.threats = find_threats(cfg, now, stations or [], far_ring, wind_now, wind_hourly)
+                   sigma0=sigma0, wind_now=wind_now, surface=wind_hourly or {}, trajs=trajs)
+    a.threats = find_threats(cfg, stations or [], [t for t in trajs if t.lead_h <= cfg.watch_hours],
+                             origin_model)
+    if plumes is not None:
+        a.smoke = assess_smoke(cfg, plumes, trajs)
     if wind_now and ring:
         adv = advected(ring, wind_now, cfg.ring_km, now)
         a.upwind_now = adv[0] if adv else None
-    if wind_now and stations:
-        # Worst air currently upwind within ~3h travel: what "if this persists" brings.
-        ests = [upwind_obs(stations, cfg.lat, cfg.lon, wind_now, h) for h in (1, 2, 3)]
+    if stations:
+        # Worst air arriving within ~3h: what "if this persists" brings.
+        ests = [traj_obs(stations, tr) for tr in trajs if tr.lead_h <= 3 and tr.path_km >= 10]
         vals = [e[0] for e in ests if e]
         if vals:
             a.upwind_now = max(vals + ([a.upwind_now] if a.upwind_now is not None else []))
@@ -568,24 +708,292 @@ def assess(cfg: Config, model: List[Tuple[int, float]], residuals: List[Tuple[in
                     gap = up_c - corrected
                     corrected += wind_weight(w.speed, cfg.wind_weight) * gap
                     sigma = math.hypot(sigma, 0.5 * gap)
-            if stations:
-                # Air arriving at h travelled under the winds between now and h.
-                path = [wind_now] if wind_now else []
-                path += [v for t, v in sorted((wind_hourly or {}).items()) if now < t <= ts]
-                mw = mean_wind(path) or w
-                est = upwind_obs(stations, cfg.lat, cfg.lon, mw, lead)
+            tr = by_ts.get(ts)
+            if stations and tr is not None:
+                est = traj_obs(stations, tr)
                 if est is not None:
-                    obs_aqi, conf = est
+                    obs_aqi, spread, conf = est
                     up = obs_aqi if up is None else max(up, obs_aqi)
                     gap = obs_aqi - corrected
-                    corrected += cfg.obs_weight * conf * min(1.0, mw.speed / 3.0) * gap
-                    sigma = math.hypot(sigma, 0.5 * (1 - conf) * abs(gap))
+                    # Air that barely moved is the current reading again; bias correction covers it.
+                    k = min(1.0, tr.path_km / 30)
+                    corrected += cfg.obs_weight * conf * k * gap
+                    sigma = math.hypot(sigma, spread, 0.5 * (1 - conf) * abs(gap))
             if w.speed < cfg.stagnant_ms:
                 sigma = math.hypot(sigma, cfg.stagnant_sigma * (1 - w.speed / cfg.stagnant_ms))
 
         a.hours.append(HourForecast(ts, lead, m, corrected, sigma,
-                                    prob_exceed(corrected, sigma, cfg.threshold), w, up))
+                                    prob_exceed(corrected, sigma, cfg.threshold), w, up, by_ts.get(ts)))
     return a
+
+
+# --------------------------------------------------------------------------- smoke (NOAA HMS)
+
+DENSITY_WEIGHT = {"light": 1, "medium": 2, "heavy": 3}
+
+
+@dataclass
+class Plume:
+    density: str  # light / medium / heavy (as analysed from satellite imagery)
+    start: Optional[int]
+    end: Optional[int]
+    rings: List[List[Tuple[float, float]]]  # (lon, lat)
+    bbox: Tuple[float, float, float, float]  # lon_min, lat_min, lon_max, lat_max
+
+    @property
+    def weight(self) -> int:
+        return DENSITY_WEIGHT.get(self.density, 1)
+
+
+def parse_shp(b: bytes) -> List[Optional[Tuple[Tuple[float, ...], List[List[Tuple[float, float]]]]]]:
+    """Polygons from an ESRI .shp file: [(bbox, rings)] in record order (None for null shapes)."""
+    out, pos = [], 100
+    while pos + 8 <= len(b):
+        _, words = struct.unpack(">ii", b[pos:pos + 8])
+        c = b[pos + 8:pos + 8 + words * 2]
+        pos += 8 + words * 2
+        stype = struct.unpack("<i", c[:4])[0] if len(c) >= 4 else 0
+        if stype not in (5, 15, 25):  # polygon, polygonZ, polygonM
+            out.append(None)
+            continue
+        bbox = struct.unpack("<4d", c[4:36])
+        nparts, npts = struct.unpack("<2i", c[36:44])
+        parts = list(struct.unpack(f"<{nparts}i", c[44:44 + 4 * nparts])) + [npts]
+        xy = struct.unpack(f"<{2 * npts}d", c[44 + 4 * nparts:44 + 4 * nparts + 16 * npts])
+        rings = [[(xy[2 * k], xy[2 * k + 1]) for k in range(parts[i], parts[i + 1])] for i in range(nparts)]
+        out.append((bbox, rings))
+    return out
+
+
+def parse_dbf(b: bytes) -> List[Dict[str, str]]:
+    """Records from a dBASE .dbf file as {field: text}."""
+    nrec = struct.unpack("<I", b[4:8])[0]
+    hlen, rlen = struct.unpack("<HH", b[8:12])
+    fields, pos = [], 32
+    while pos < hlen and b[pos] != 0x0D:
+        name = b[pos:pos + 11].split(b"\0")[0].decode("latin-1")
+        fields.append((name, b[pos + 16]))
+        pos += 32
+    out = []
+    for r in range(nrec):
+        rec = b[hlen + r * rlen:hlen + (r + 1) * rlen]
+        if not rec or rec[:1] == b"*":  # deleted
+            continue
+        row, off = {}, 1
+        for name, ln in fields:
+            row[name] = rec[off:off + ln].decode("latin-1").strip()
+            off += ln
+        out.append(row)
+    return out
+
+
+def _hms_time(v: str) -> Optional[int]:
+    """HMS times look like '2026301 1510' (year, day of year, HHMM UTC)."""
+    try:
+        return calendar.timegm(time.strptime(v.strip(), "%Y%j %H%M"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def parse_hms_zip(data: bytes) -> List[Plume]:
+    zf = zipfile.ZipFile(io.BytesIO(data))
+    names = {n.lower().rsplit(".", 1)[-1]: n for n in zf.namelist()}
+    shapes = parse_shp(zf.read(names["shp"]))
+    rows = parse_dbf(zf.read(names["dbf"])) if "dbf" in names else [{}] * len(shapes)
+    plumes = []
+    for shape, row in zip(shapes, rows):
+        if shape is None:
+            continue
+        low = {k.lower(): v for k, v in row.items()}
+        plumes.append(Plume(low.get("density", "").lower() or "light",
+                            _hms_time(low.get("start", "")), _hms_time(low.get("end", "")),
+                            shape[1], shape[0]))
+    return plumes
+
+
+_HMS_CACHE: Dict[str, object] = {"fetched": 0.0, "plumes": None}
+
+
+def fetch_hms(cfg: Config, now: float) -> List[Plume]:
+    """Latest HMS smoke analysis (today's and yesterday's UTC files), cached ~50 min."""
+    if _HMS_CACHE["plumes"] is not None and now - float(_HMS_CACHE["fetched"]) < 50 * 60:
+        return _HMS_CACHE["plumes"]  # type: ignore[return-value]
+    patterns = [cfg.hms_url] if cfg.hms_url else HMS_URLS
+    plumes: List[Plume] = []
+    found = False
+    for day in (now, now - 24 * HOUR):
+        t = time.gmtime(day)
+        for pat in patterns:
+            url = time.strftime(pat, t)
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "aqi-monitor/1.0"})
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    plumes += parse_hms_zip(r.read())
+                found = True
+                break
+            except urllib.error.HTTPError as e:
+                if e.code != 404:
+                    raise
+    if not found:
+        raise RuntimeError("no HMS smoke file found for today or yesterday")
+    # Keep the latest analysis: plumes ending within 6h of the newest one, and not older than 36h.
+    ends = [p.end for p in plumes if p.end]
+    if ends:
+        latest = max(ends)
+        plumes = [p for p in plumes if p.end and p.end >= latest - 6 * HOUR and latest >= now - 36 * HOUR]
+    _HMS_CACHE.update(fetched=now, plumes=plumes)
+    return plumes
+
+
+def _inside(x: float, y: float, rings: List[List[Tuple[float, float]]]) -> bool:
+    """Even-odd rule over all rings, so holes work."""
+    inside = False
+    for ring in rings:
+        for (x1, y1), (x2, y2) in zip(ring, ring[1:] + ring[:1]):
+            if (y1 > y) != (y2 > y) and x < x1 + (y - y1) * (x2 - x1) / (y2 - y1):
+                inside = not inside
+    return inside
+
+
+def plume_distance(lat: float, lon: float, p: Plume) -> Tuple[float, float]:
+    """(km to the plume edge, bearing to nearest point); 0 km when inside."""
+    if _inside(lon, lat, p.rings):
+        return 0.0, 0.0
+    best, bx, by = float("inf"), 0.0, 0.0
+    for ring in p.rings:
+        pts = [local_km(lat, lon, la, lo) for lo, la in ring]
+        for (x1, y1), (x2, y2) in zip(pts, pts[1:] + pts[:1]):
+            dx, dy = x2 - x1, y2 - y1
+            L = dx * dx + dy * dy
+            f = 0.0 if L == 0 else max(0.0, min(1.0, -(x1 * dx + y1 * dy) / L))
+            cx, cy = x1 + f * dx, y1 + f * dy
+            d = math.hypot(cx, cy)
+            if d < best:
+                best, bx, by = d, cx, cy
+    return best, math.degrees(math.atan2(bx, by)) % 360
+
+
+SMOKE_NAMES = {0: "none", 1: "within 100 mi", 2: "within 50 mi", 3: "overhead", 4: "dense overhead"}
+
+
+@dataclass
+class Smoke:
+    level: int
+    overhead: List[str]  # densities of plumes directly overhead
+    n50: int             # plumes 0-50 mi away (not overhead)
+    n100: int            # plumes 50-100 mi away
+    nearest_km: Optional[float]
+    nearest_brg: float
+    score: float         # overhead weights + 0.5 x within 50 mi + 0.25 x within 100 mi
+    analysed: Optional[int]
+    incoming_eta: Optional[int] = None
+    incoming_support: float = 0.0
+    incoming_density: str = ""
+    incoming_km: float = 0.0
+    incoming_brg: float = 0.0
+
+
+def assess_smoke(cfg: Config, plumes: List[Plume], trajs: List[Trajectory]) -> Smoke:
+    over, n50, n100, score = [], 0, 0, 0.0
+    near: Optional[Tuple[float, float]] = None
+    for p in plumes:
+        # Cheap reject: bbox more than ~600 km away.
+        if not (p.bbox[1] - 5.5 < cfg.lat < p.bbox[3] + 5.5):
+            continue
+        d, brg = plume_distance(cfg.lat, cfg.lon, p)
+        if d == 0:
+            over.append(p.density)
+            score += p.weight
+            continue
+        if near is None or d < near[0]:
+            near = (d, brg)
+        if d <= 50 * MI:
+            n50 += 1
+            score += 0.5 * p.weight
+        elif d <= 100 * MI:
+            n100 += 1
+            score += 0.25 * p.weight
+    over_w = sum(DENSITY_WEIGHT.get(d, 1) for d in over)
+    level = (4 if over and (over_w >= 3 or len(over) >= 3) else 3 if over
+             else 2 if n50 else 1 if n100 else 0)
+    ends = [p.end for p in plumes if p.end]
+    sm = Smoke(level, sorted(over, key=lambda d: -DENSITY_WEIGHT.get(d, 1)), n50, n100,
+               near[0] if near else None, near[1] if near else 0.0, score, max(ends) if ends else None)
+
+    # Incoming: back-trajectories (next 12h) that start inside a plume.
+    for tr in sorted(trajs, key=lambda t: t.ts):
+        if tr.lead_h > 12 or tr.path_km < 10:
+            continue
+        inside = []
+        for la, lo, _ in tr.origins:
+            dens = next((p.density for p in plumes if _inside(lo, la, p.rings)), None)
+            inside.append(dens)
+        k = sum(d is not None for d in inside)
+        if inside[0] is not None and k >= 2 or k >= 3:
+            la, lo, _ = tr.origins[0]
+            sm.incoming_eta, sm.incoming_support = tr.ts, k / len(SCENARIOS)
+            sm.incoming_density = next(d for d in inside if d)
+            sm.incoming_km, sm.incoming_brg = distance_bearing(cfg.lat, cfg.lon, la, lo)
+            break
+    return sm
+
+
+def smoke_details(sm: Smoke) -> str:
+    parts = []
+    if sm.overhead:
+        parts.append(f"overhead: {len(sm.overhead)} ({', '.join(sm.overhead)})")
+    parts.append(f"within 50 mi: {sm.n50}")
+    parts.append(f"50-100 mi: {sm.n100}")
+    if sm.nearest_km is not None and not sm.overhead:
+        parts.append(f"nearest {sm.nearest_km / MI:.0f} mi {compass(sm.nearest_brg)}")
+    parts.append(f"score {sm.score:.1f}")
+    return "Smoke plumes " + "; ".join(parts) + "."
+
+
+def decide_smoke(cfg: Config, st: Dict[str, float], sm: Smoke, aqi_now: float,
+                 now: float) -> Optional["Message"]:
+    """st holds notified (level last alerted), incoming (0/1), below_since. Mutated in place."""
+    when = f" (NOAA HMS analysis {_fmt_time(sm.analysed)})" if sm.analysed else ""
+    tail = f" AQI now {aqi_now:.0f}. Satellite smoke may be aloft; AQI doesn't measure smoke VOCs.{when}"
+    notified = int(st.get("notified", 0))
+    if sm.level > notified:
+        st.update(notified=sm.level, below_since=0)
+        near = f"{sm.nearest_km / MI:.0f} mi {compass(sm.nearest_brg)}" if sm.nearest_km is not None else ""
+        title = {
+            1: f"Smoke plume within 100 mi ({near})",
+            2: f"Smoke plume within 50 mi ({near})",
+            3: f"Smoke plume overhead ({', '.join(sm.overhead)})",
+            4: f"Dense smoke overhead ({len(sm.overhead)} plumes: {', '.join(sm.overhead)})",
+        }[sm.level]
+        arrive = ""
+        if sm.incoming_eta and sm.level < 3 and not st.get("incoming"):
+            st["incoming"] = 1
+            arrive = (f" Forecast winds may bring it here ~{_fmt_time(sm.incoming_eta)} "
+                      f"({sm.incoming_support * len(SCENARIOS):.0f}/{len(SCENARIOS)} wind scenarios).")
+        return Message(title, smoke_details(sm) + arrive + tail, {1: 2, 2: 3, 3: 3, 4: 4}[sm.level], "fog")
+    if sm.level < notified:
+        # Only step down after the lower level has held for a while: plumes jitter between analyses.
+        if not st.get("below_since"):
+            st["below_since"] = now
+        elif now - st["below_since"] >= cfg.smoke_clear_hours * HOUR:
+            st.update(notified=sm.level, below_since=0)
+            if sm.level == 0:
+                st["incoming"] = 0
+                return Message("Smoke plumes cleared",
+                               f"No satellite smoke plume within 100 mi for {cfg.smoke_clear_hours:.0f}h.",
+                               2, "white_check_mark")
+    else:
+        st["below_since"] = 0
+    if sm.incoming_eta and not st.get("incoming") and sm.level < 3:
+        st["incoming"] = 1
+        return Message(
+            f"Smoke may arrive ~{_fmt_time(sm.incoming_eta)}",
+            (f"Forecast winds bring air from inside a {sm.incoming_density} smoke plume now "
+             f"~{sm.incoming_km / MI:.0f} mi {compass(sm.incoming_brg)} "
+             f"({sm.incoming_support * len(SCENARIOS):.0f}/{len(SCENARIOS)} wind scenarios). "
+             + smoke_details(sm) + tail),
+            3, "fog")
+    return None
 
 
 # --------------------------------------------------------------------------- alert state
@@ -610,8 +1018,9 @@ def next_level(cfg: Config, prev: str, a: Assessment) -> str:
 
 def is_bad(cfg: Config, level: str, a: Assessment) -> bool:
     """Poll faster whenever anything is brewing."""
+    smoky = a.smoke is not None and (a.smoke.level > 0 or a.smoke.incoming_eta is not None)
     return (level != CLEAR or a.max_p >= cfg.clear_prob
-            or a.current > cfg.threshold - cfg.hysteresis)
+            or a.current > cfg.threshold - cfg.hysteresis or smoky)
 
 
 @dataclass
@@ -630,7 +1039,7 @@ def wind_text(a: Assessment) -> str:
     w = a.wind_now
     if w is None:
         return ""
-    txt = f"Wind {compass(w.direction)} {w.speed:.0f} m/s"
+    txt = f"Wind {compass(w.direction)} {w.speed * MPH:.0f} mph"
     if a.upwind_now is not None:
         txt += f", upwind air ~{a.upwind_now:.0f}"
     elif w.speed < 0.5:
@@ -638,21 +1047,26 @@ def wind_text(a: Assessment) -> str:
     return txt + "."
 
 
-# AirNow data-use guidelines: our numbers are estimates, not official forecasts.
-DISCLAIMER = "(Personal estimate, not an official forecast. See airnow.gov.)"
-
-
 def wind_outlook(a: Assessment) -> str:
-    """e.g. 'Wind next 12h: S 5 -> SW 4 -> W 3 m/s.'"""
-    pts = [h for h in a.hours if h.wind and round(h.lead_h) in (3, 6, 12)]
-    if not pts:
-        return ""
-    return "Wind next 12h: " + " -> ".join(f"{compass(h.wind.direction)} {h.wind.speed:.0f}" for h in pts) + " m/s."
+    """Several time scales so a short spike isn't hidden by averaging, e.g.
+    'Wind (mph) 0-6h: S 4 (max 6); 6-12h: S 9 (max 12); 12-24h: SW 13 (max 15, gusts 24).'"""
+    parts = []
+    for lo, hi in ((0, 6), (6, 12), (12, 24)):
+        ws = [w for t, w in sorted(a.surface.items()) if a.now + lo * HOUR < t <= a.now + hi * HOUR]
+        if not ws:
+            continue
+        m = mean_wind(ws)
+        txt = f"{lo}-{hi}h: {compass(m.direction)} {m.speed * MPH:.0f} (max {max(w.speed for w in ws) * MPH:.0f}"
+        gusts = [w.gust for w in ws if w.gust is not None]
+        if gusts and max(gusts) >= 1.5 * max(w.speed for w in ws):
+            txt += f", gusts {max(gusts) * MPH:.0f}"
+        parts.append(txt + ")")
+    return ("Wind (mph) " + "; ".join(parts) + ".") if parts else ""
 
 
 def threat_text(t: Threat) -> str:
-    where = "CAMS model" if t.name == "model" else f"AirNow {t.name}, preliminary"
-    return f"AQI {t.aqi:.0f} ({where}) {t.km / 1.609:.0f} mi {compass(t.bearing)}"
+    where = "model" if t.name == "model" else f"AirNow {t.name}"
+    return f"AQI {t.aqi:.0f} ({where}) {t.km / MI:.0f} mi {compass(t.bearing)}"
 
 
 def decide(cfg: Config, prev: str, last_notified: float, a: Assessment) -> Tuple[str, Optional[Message]]:
@@ -674,15 +1088,15 @@ def decide(cfg: Config, prev: str, last_notified: float, a: Assessment) -> Tuple
         return level, Message(
             title=f"AQI may exceed {thr} by {when}",
             body=(f"Now {a.current:.0f}. Estimated chance of >{thr} within {cfg.horizon_hours}h: "
-                  f"{a.max_p:.0%}. {peak_txt} {DISCLAIMER}"),
+                  f"{a.max_p:.0%}. {peak_txt} {wind_outlook(a)}").strip(),
             priority=3, tags="warning")
     if level == WATCH and RANK[prev] < RANK[WATCH]:
         t = a.threats[0]
         return level, Message(
-            title=f"Possible AQI rise: {t.aqi:.0f} upwind {t.km / 1.609:.0f} mi {compass(t.bearing)}",
-            body=(f"Now {a.current:.0f}. {threat_text(t)}. Wind from {compass(t.wind.direction)} "
-                  f"{t.wind.speed:.0f} m/s; could arrive ~{_fmt_time(t.eta)} if it persists. "
-                  f"{wind_outlook(a)} Check the weather. {DISCLAIMER}").replace("  ", " "),
+            title=f"Possible AQI rise: {t.aqi:.0f} upwind {t.km / MI:.0f} mi {compass(t.bearing)}",
+            body=(f"Now {a.current:.0f}. {threat_text(t)}. Forecast winds bring that air here "
+                  f"~{_fmt_time(t.eta)} if it persists ({t.support * len(SCENARIOS):.0f}/{len(SCENARIOS)} "
+                  f"wind scenarios). {wind_outlook(a)} Check the weather.").replace("  ", " "),
             priority=3, tags="eyes")
     if level == CLEAR and prev != CLEAR:
         body = (f"Below {thr} and not expected to exceed it in the next {cfg.horizon_hours}h."
@@ -768,30 +1182,52 @@ def tick(cfg: Config, store: Store, send: bool = True) -> Assessment:
         if m is not None:
             store.add_residual(obs[0], obs[1], m)
 
-    wind_now, wind_hourly, ring = None, None, None
+    wind_now, surface, ring = None, {}, None
+    trajs: List[Trajectory] = []
     if cfg.use_wind:
         try:  # Wind refines the forecast; never let it block alerts.
-            wind_now, wind_hourly = fetch_wind(cfg)
+            wind_now, surface, transport = fetch_wind(cfg)
+            trajs = back_trajectories(cfg, now, transport, max(cfg.watch_hours, cfg.horizon_hours))
             ring = fetch_ring(cfg, cfg.ring_km)
         except Exception as e:
             log.warning("wind/upwind fetch failed: %s", e)
-    far_ring = None
-    if cfg.use_wind and wind_now is not None:
-        try:  # model view of what's out at upwind_km, for the watch (works without AirNow)
-            far_ring = fetch_ring(cfg, cfg.upwind_km)
+    origin_model: Dict[int, float] = {}
+    picks = [tr for tr in trajs if round(tr.lead_h) % 3 == 0 and tr.path_km >= 30]
+    if picks:
+        try:  # model AQI where the air arriving every 3h is now (works without AirNow)
+            for tr, series in zip(picks, fetch_points(cfg, [o[:2] for o in (t.origins[0] for t in picks)])):
+                v = interp(series, now)
+                if v is not None:
+                    origin_model[tr.ts] = v
         except Exception as e:
-            log.warning("far ring fetch failed: %s", e)
+            log.warning("trajectory-origin model fetch failed: %s", e)
+    plumes = None
+    if cfg.smoke:
+        try:
+            plumes = fetch_hms(cfg, now)
+        except Exception as e:
+            log.warning("HMS smoke fetch failed: %s", e)
 
-    a = assess(cfg, model, store.residuals(now - 7 * 24 * HOUR), obs, now, wind_now, wind_hourly,
-               ring, stations, far_ring)
+    a = assess(cfg, model, store.residuals(now - 7 * 24 * HOUR), obs, now, wind_now, surface,
+               ring, stations, trajs, origin_model, plumes)
     peak = a.peak
     log.info("current=%.0f (%s) bias=%+.1f sigma0=%.1f max_p=%.0f%% peak=%s %s",
              a.current, a.current_source, a.bias, a.sigma0, a.max_p * 100,
              f"{peak.corrected:.0f}@+{peak.lead_h:.0f}h" if peak else "n/a", wind_text(a))
     for t in a.threats[:3]:
-        log.info("upwind: %s, eta %s", threat_text(t), _fmt_time(t.eta))
+        log.info("upwind: %s, eta %s (%.0f%% of scenarios)", threat_text(t), _fmt_time(t.eta), t.support * 100)
+    if a.smoke is not None:
+        log.info("smoke: level %d (%s). %s", a.smoke.level, SMOKE_NAMES[a.smoke.level], smoke_details(a.smoke))
     if not send:
         return a
+
+    if a.smoke is not None:
+        st = {k: float(store.get("smoke_" + k, "0")) for k in ("notified", "incoming", "below_since")}
+        smsg = decide_smoke(cfg, st, a.smoke, a.current, now)
+        if smsg:
+            notify(cfg, smsg)
+        for k, v in st.items():
+            store.set("smoke_" + k, v)
 
     prev = store.get("level", CLEAR)
     last = float(store.get("last_notified", "0"))
@@ -832,15 +1268,30 @@ def run_forever(cfg: Config, store: Store) -> None:
 def print_status(cfg: Config, a: Assessment) -> None:
     print(f"Current AQI: {a.current:.0f} ({a.current_source})  bias={a.bias:+.1f}  sigma0={a.sigma0:.1f}")
     print(wind_text(a) or "Wind: unavailable")
+    print(wind_outlook(a))
     for t in a.threats[:5]:
-        print(f"Upwind: {threat_text(t)}, could arrive ~{_fmt_time(t.eta)}")
+        print(f"Upwind: {threat_text(t)}, could arrive ~{_fmt_time(t.eta)} "
+              f"({t.support * len(SCENARIOS):.0f}/{len(SCENARIOS)} scenarios)")
+    if a.smoke is not None:
+        sm = a.smoke
+        print(f"Smoke: level {sm.level} ({SMOKE_NAMES[sm.level]}). {smoke_details(sm)}")
+        if sm.incoming_eta:
+            print(f"  incoming ~{_fmt_time(sm.incoming_eta)} from a {sm.incoming_density} plume "
+                  f"{sm.incoming_km / MI:.0f} mi {compass(sm.incoming_brg)}")
+    else:
+        print("Smoke: unavailable")
     print(f"Threshold {cfg.threshold:.0f}; max chance of exceeding in next {cfg.horizon_hours}h: {a.max_p:.0%}\n")
-    print(f"{'time':>10} {'lead':>5} {'wind':>8} {'upwind':>6} {'model':>6} {'corr':>6} {'+/-':>5} {'P>thr':>6}")
+    print(f"{'time':>10} {'lead':>5} {'wind mph':>9} {'air from':>12} {'upwind':>6} {'model':>6} "
+          f"{'corr':>6} {'+/-':>5} {'P>thr':>6}")
     for h in a.hours:
-        wind = f"{compass(h.wind.direction)} {h.wind.speed:.0f}" if h.wind else "-"
+        wind = f"{compass(h.wind.direction)} {h.wind.speed * MPH:.0f}" if h.wind else "-"
+        src = "-"
+        if h.traj is not None:
+            km, brg = distance_bearing(cfg.lat, cfg.lon, *h.traj.origins[0][:2])
+            src = f"{km / MI:.0f} mi {compass(brg)}"
         up = f"{h.upwind:.0f}" if h.upwind is not None else "-"
         bar = "#" * int(h.p_exceed * 20)
-        print(f"{_fmt_time(h.ts):>10} {h.lead_h:4.0f}h {wind:>8} {up:>6} {h.model:6.0f} "
+        print(f"{_fmt_time(h.ts):>10} {h.lead_h:4.0f}h {wind:>9} {src:>12} {up:>6} {h.model:6.0f} "
               f"{h.corrected:6.0f} {h.sigma:5.1f} {h.p_exceed:6.0%} {bar}")
 
 

@@ -15,32 +15,53 @@ Each poll (every 15 min by default):
    This is a crude version of the Kalman-filter bias correction NOAA uses
    for its air-quality forecasts (see *Prior work*).
 3. **Wind, model upwind:** model AQI on a 50 km ring around you. For each hour,
-   the ring point the wind blows *from* and the travel time
-   (`50 km / wind speed`) give an "advected" AQI, which pulls the forecast toward it.
-4. **Wind, observed upwind:** AirNow monitors within 150 km (PM2.5,
-   PM10, ozone, CO, NO₂). Uses the average wind vector from now to hour *h*, keeps
-   monitors in the upwind cone, and weights each by alignment and by how closely its
-   travel time matches *h*. If the plume persists, their readings show what
-   arrives when. This catches wildfire smoke that the model misses.
-5. **Uncertainty:** σ grows with lead time, with model/upwind disagreement, and
-   in calm air (stagnation). `P(exceed) = 1 − Φ((35 − forecast)/σ)`.
-6. **Upwind watch:** independent of the forecast math. If any AirNow monitor (or
-   the model, at ~105 mi out) within 105 mi reads above 35, and the current wind
-   or the next 6 h of forecast wind is blowing from it toward you (within ±45°),
-   you get a heads-up with an estimated arrival time.
-7. **Alerts:** a `clear → watch → forecast → now` state machine with hysteresis and
-   reminders, so it doesn't spam you. Alert messages:
-   - 👀 *Possible AQI rise: 45 upwind 99 mi S*: wind from S 5 m/s, could arrive
-     ~18:00 if it persists, plus the 12 h wind outlook and "check the weather"
+   the ring point the wind blows *from* pulls the forecast toward its value.
+4. **Back-trajectories:** for every hour in the next 24 h, the air that will
+   arrive is traced backwards through the hourly forecast winds to where it is
+   now. The transport wind is the mean of the 10 m and 850 hPa winds. Nothing is
+   smoothed, so a 3-hour wind spike or a wind shift counts where it happens. Five
+   wind scenarios are traced (forecast as-is, direction ±20°, speed ×0.7 and ×1.3),
+   and their disagreement widens the uncertainty.
+5. **Upwind monitors:** AirNow monitors (PM2.5, PM10, ozone, CO, NO₂) within
+   ~155 mi near each trajectory's starting point tell what air is on its way,
+   assuming it persists. This catches wildfire smoke the model misses.
+6. **Uncertainty:** σ grows with lead time, with scenario spread and model/upwind
+   disagreement, and in calm air (stagnation). `P(exceed) = 1 − Φ((35 − forecast)/σ)`.
+7. **Upwind watch:** if any monitor (or the model where the trajectories start)
+   reads above 35 and forecast winds bring that air to you within 24 h, you get
+   a heads-up with an arrival time and how many wind scenarios agree.
+8. **Smoke (separate state):** NOAA HMS satellite smoke plumes, the same gray
+   polygons as on fire.airnow.gov. AQI monitors don't measure smoke VOCs, so this
+   is tracked separately:
+
+   | Level | Meaning |
+   |---|---|
+   | 0 | no plume within 100 mi |
+   | 1 | plume within 100 mi |
+   | 2 | plume within 50 mi |
+   | 3 | plume overhead |
+   | 4 | dense overhead: overlapping plumes (density weights ≥ 3) or a heavy plume |
+
+   Each alert lists plumes overhead, within 50 mi and within 50–100 mi, the nearest
+   plume's distance and direction, and a score (overhead density weights +
+   0.5 × within 50 mi + 0.25 × within 100 mi; light = 1, medium = 2, heavy = 3).
+   It's flagged **incoming** when the back-trajectories start inside a plume
+   within the next 12 h.
+9. **Alerts:**
+   - 👀 *Possible AQI rise: 45 upwind 99 mi S*: arrival time, scenario agreement,
+     and the wind outlook at 0–6 h / 6–12 h / 12–24 h (mean, max and gusts in mph,
+     so spikes stay visible)
    - ⚠️ *AQI may exceed 35 by Wed 14:00*, sent when any hour in the next 12 h has P ≥ 50%
    - 🚨 *AQI 52, above 35 now*, repeated at most every 6 h
-   - ✅ *AQI back to 22* / *Upwind watch over*, sent once it's ≤ 30, P < 20% and
-     nothing bad is upwind
+   - ✅ *AQI back to 22* / *Upwind watch over*
+   - 🌫️ *Smoke plume within 50 mi (47 mi SW)* / *Smoke plume overhead (light)* /
+     *Dense smoke overhead* / *Smoke may arrive ~19:00*: sent when the level rises.
+     Drops are silent until they've held for 3 h; *Smoke plumes cleared* when back to 0.
    - ❌ *monitor can't get data*, sent after 6 failed polls in a row (~3 h)
-8. **Polling:** every 60 min when everything is clear, every 30 min when anything
-   is brewing (any alert level, P ≥ 20%, or AQI within 5 of the threshold).
+10. **Polling:** every 60 min when everything is clear, every 30 min when anything
+    is brewing (any alert level, P ≥ 20%, AQI within 5 of the threshold, or any smoke).
 
-Run `python3 aqi_monitor.py status` to see the hourly table it uses to decide.
+Run `.venv/bin/python aqi_monitor.py status` to see the hourly table it uses to decide.
 
 ### What it doesn't see
 
@@ -196,8 +217,9 @@ warning about 2 h ahead.
 ## Data sources and AirNow data-use guidelines
 
 - **AirNow** (US EPA and the federal, state, local and tribal agencies that own
-  the monitors): observed values are **preliminary**, not validated. They are
-  passed through unchanged and labeled as preliminary in alerts.
+  the monitors): observed values are **preliminary**, not validated, and are
+  passed through unchanged. Alerts don't carry a disclaimer; add one back if you
+  share alerts with others.
 - **Open-Meteo / CAMS:** model AQI and wind forecasts.
 - This tool's probabilities and "may exceed" alerts are **personal estimates, not
   official forecasts or advisories**. Official ones come from the agencies via airnow.gov.
@@ -215,6 +237,7 @@ AirNow's guidelines matter if this goes beyond personal use:
 
 - Air-quality and weather forecasts: [Open-Meteo](https://open-meteo.com/)
   (CC BY 4.0), using Copernicus Atmosphere Monitoring Service (CAMS) data.
+- Smoke plumes: NOAA NESDIS Hazard Mapping System (HMS) smoke analysis.
 - Observations: the U.S. EPA AirNow program and the state, local and tribal
   agencies that operate the monitors. Data are preliminary; see above.
 
