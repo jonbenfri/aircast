@@ -1058,10 +1058,38 @@ class PlumeCluster:
     bearing: float     # toward the nearest edge
     density: str       # densest part of the plume
     here: Optional[str]  # density at your location, if overhead
+    xy: List[List[List[Tuple[float, float]]]] = field(default_factory=list)  # member rings, local km
+    boxes: List[Tuple[float, float, float, float]] = field(default_factory=list)
 
     @property
     def weight(self) -> int:
         return DENSITY_WEIGHT.get(self.here or self.density, 1)
+
+    def covers(self, x: float, y: float) -> bool:
+        return any(b[0] <= x <= b[2] and b[1] <= y <= b[3] and _inside(x, y, r)
+                   for r, b in zip(self.xy, self.boxes))
+
+    def directions(self, lo_km: float, hi_km: float) -> str:
+        """Compass directions this plume covers between lo_km and hi_km, e.g. 'S/SE'."""
+        steps = max(2, int((hi_km - lo_km) / 8))
+        radii = [max(2.0, lo_km + (hi_km - lo_km) * (k + 0.5) / steps) for k in range(steps)]
+        sectors = set()
+        for i in range(32):  # sample every 11.25 deg, report as 8-point compass
+            a = math.radians(i * 11.25)
+            if any(self.covers(r * math.sin(a), r * math.cos(a)) for r in radii):
+                sectors.add(int((i * 11.25 + 22.5) // 45) % 8)
+        if lo_km <= self.min_km <= hi_km:
+            sectors.add(int((self.bearing % 360 + 22.5) // 45) % 8)
+        if not sectors:
+            return ""
+        if len(sectors) >= 7:
+            return "all around"
+        # Start after the largest gap so the run reads clockwise, e.g. S/SE not SE/S.
+        order = sorted(sectors)
+        gaps = [((order[(k + 1) % len(order)] - order[k]) % 8, k) for k in range(len(order))]
+        start = (max(gaps)[1] + 1) % len(order)
+        run = order[start:] + order[:start]
+        return "/".join(COMPASS[k] for k in run[::-1]) if len(run) > 1 else COMPASS[run[0]]
 
 
 def cluster_plumes(cfg: Config, plumes: List[Plume], reach_km: float, gap_km: float = 5.0) -> List[PlumeCluster]:
@@ -1105,7 +1133,8 @@ def cluster_plumes(cfg: Config, plumes: List[Plume], reach_km: float, gap_km: fl
             continue
         dens = max((m.density for m in members), key=lambda d: DENSITY_WEIGHT.get(d, 1))
         out.append(PlumeCluster(members, nearest[0], far, nearest[1], dens,
-                                max(here, key=lambda d: DENSITY_WEIGHT.get(d, 1)) if here else None))
+                                max(here, key=lambda d: DENSITY_WEIGHT.get(d, 1)) if here else None,
+                                [xy[i] for i in idx], [boxes[i] for i in idx]))
     return sorted(out, key=lambda c: c.min_km)
 
 
@@ -1126,6 +1155,7 @@ class Smoke:
     n_far: int = 0       # plumes reaching into 100 mi - smoke_far_mi
     far_mi: float = 200.0
     n_plumes: int = 0    # distinct plumes within far_mi
+    band_dirs: List[List[str]] = field(default_factory=list)  # per band: directions of each plume in it
     incoming_eta: Optional[int] = None
     incoming_support: float = 0.0
     incoming_density: str = ""
@@ -1143,6 +1173,8 @@ def assess_smoke(cfg: Config, plumes: List[Plume], trajs: List[Trajectory],
     bands = [(0.0, 50 * MI, 0.5), (50 * MI, 100 * MI, 0.25), (100 * MI, far_km, 0.125)]
     clusters = cluster_plumes(cfg, plumes, far_km)
     counts = [sum(1 for c in clusters if c.min_km <= hi and c.max_km >= lo) for lo, hi, _ in bands]
+    band_dirs = [[c.directions(lo, hi) for c in clusters if c.min_km <= hi and c.max_km >= lo]
+                 for lo, hi, _ in bands]
     over = [c.here for c in clusters if c.here]
     score = 0.0
     for c in clusters:
@@ -1158,7 +1190,7 @@ def assess_smoke(cfg: Config, plumes: List[Plume], trajs: List[Trajectory],
     sm = Smoke(level, sorted(over, key=lambda d: -DENSITY_WEIGHT.get(d, 1)), counts[0], counts[1],
                nearest.min_km if nearest else None, nearest.bearing if nearest else 0.0, score,
                max(ends) if ends else None, n_far=counts[2], far_mi=cfg.smoke_far_mi,
-               n_plumes=len(clusters))
+               n_plumes=len(clusters), band_dirs=band_dirs)
     if now is not None:
         sm.mix_now = blh_at(blh or {}, now)
 
@@ -1191,12 +1223,15 @@ def smoke_details(sm: Smoke) -> str:
     parts = [f"{sm.n_plumes} within {sm.far_mi:.0f} mi"]
     if sm.overhead:
         parts.append(f"overhead: {len(sm.overhead)} ({', '.join(sm.overhead)})")
-    parts.append(f"reaching 0-50 mi: {sm.n50}")
-    parts.append(f"50-100 mi: {sm.n100}")
-    parts.append(f"100-{sm.far_mi:.0f} mi: {sm.n_far}")
+    def d(k):
+        dirs = [x for x in (sm.band_dirs[k] if k < len(sm.band_dirs) else []) if x]
+        return f" ({', '.join(dirs)})" if dirs else ""
+    parts.append(f"reaching 0-50 mi: {sm.n50}{d(0)}")
+    parts.append(f"50-100 mi: {sm.n100}{d(1)}")
+    parts.append(f"100-{sm.far_mi:.0f} mi: {sm.n_far}{d(2)}")
     if sm.nearest_km is not None and not sm.overhead:
         parts.append(f"nearest {sm.nearest_km / MI:.0f} mi {compass(sm.nearest_brg)}")
-    parts.append(f"score {sm.score:.1f}")
+    parts.append(f"score {_num(sm.score)}")
     return "Smoke plumes " + "; ".join(parts) + "."
 
 
@@ -1206,9 +1241,20 @@ def smoke_line(sm: Smoke) -> str:
     head = f"{sm.n_plumes} {'plume' if sm.n_plumes == 1 else 'plumes'} within {sm.far_mi:.0f} mi"
     if sm.overhead:
         head += f", {len(sm.overhead)} overhead ({', '.join(sm.overhead)})"
-    items = [head, f"reaching 0–50 mi: {sm.n50}", f"50–100 mi: {sm.n100}",
-             f"100–{sm.far_mi:.0f} mi: {sm.n_far}", f"score {sm.score:.1f}"]
+    labels = ["reaching 0–50 mi", "50–100 mi", f"100–{sm.far_mi:.0f} mi"]
+    counts = [sm.n50, sm.n100, sm.n_far]
+    items = [head]
+    for k, (label, n) in enumerate(zip(labels, counts)):
+        dirs = [d for d in (sm.band_dirs[k] if k < len(sm.band_dirs) else []) if d]
+        where = "" if not dirs else f" {dirs[0]}" if len(dirs) == 1 else f" ({', '.join(dirs)})"
+        items.append(f"{label}: {n}{where}")
+    items.append(f"score {_num(sm.score)}")
     return "Smoke: " + SEP.join(items)
+
+
+def _num(x: float) -> str:
+    """0.25 -> '0.25', 1.5 -> '1.5', 3.0 -> '3' (no rounding 0.25 down to 0.2)."""
+    return f"{x:.2f}".rstrip("0").rstrip(".")
 
 
 def decide_smoke(cfg: Config, st: Dict[str, float], sm: Smoke, a: Assessment,

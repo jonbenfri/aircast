@@ -484,3 +484,27 @@ class EnvFileTest(unittest.TestCase):
             for k in ("AQI_PLACE", "TZ", "NTFY_TOPIC"):
                 os.environ.pop(k, None)
             os.unlink(f.name)
+
+
+class PlumeDirectionTest(unittest.TestCase):
+    def test_directions_per_band(self):
+        se = plume_at(157.5, 120, half_km=30)    # between S and SE, ~75 mi out
+        w = plume_at(270, 250, half_km=40)       # due west, ~130-180 mi
+        sm = m.assess_smoke(cfg(), [se, w], [])
+        line = m.smoke_line(sm)
+        self.assertIn("50–100 mi: 1 S/SE", line)
+        self.assertIn("100–200 mi: 1 W", line)
+        self.assertIn("reaching 0–50 mi: 0", line)
+
+    def test_two_plumes_in_one_band(self):
+        sm = m.assess_smoke(cfg(), [plume_at(180, 250, half_km=20), plume_at(90, 250, half_km=20)], [])
+        self.assertIn("100–200 mi: 2 (", m.smoke_line(sm))
+        self.assertIn("S", sm.band_dirs[2])
+        self.assertIn("E", sm.band_dirs[2])
+
+    def test_wide_plume_spans_sectors(self):
+        la, lo = m.destination(LAT, LON, 225, 130)
+        wide = square(la, lo, 90)  # big plume to the SW spanning several directions
+        d = m.assess_smoke(cfg(), [wide], []).band_dirs[1][0]
+        self.assertIn("SW", d.split("/"))
+        self.assertGreaterEqual(len(d.split("/")), 2)

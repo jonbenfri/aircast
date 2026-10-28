@@ -66,7 +66,9 @@ Each poll (every 15 min by default):
    come within 5 km of each other are merged into one plume. A plume counts once in
    the total, and appears in **every distance band it reaches**: a plume stretching
    from 75 to 250 mi shows in both 50–100 and 100–200 mi. Example:
-   `Smoke: 2 plumes within 200 mi  ||  reaching 0–50 mi: 0  ||  50–100 mi: 1  ||  100–200 mi: 2  ||  score 0.4`.
+   `Smoke: 2 plumes within 200 mi  ||  reaching 0–50 mi: 0  ||  50–100 mi: 1 S/SE  ||  100–200 mi: 2 (S/SE, W)  ||  score 0.38`.
+   Directions are the compass sectors each plume covers within that band, so you can
+   compare them with the wind.
    The score adds each plume once, by its nearest edge: density weight (light 1,
    medium 2, heavy 3) × 1 overhead, 0.5 within 50 mi, 0.25 within 100 mi, 0.125
    within 200 mi. Level 5 means heavy smoke overhead.
