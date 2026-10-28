@@ -159,7 +159,7 @@ class WatchTest(unittest.TestCase):
         self.assertIsNotNone(msg)
         if lvl == m.WATCH:
             self.assertIn("99 mi S", msg.title)
-            self.assertIn("Check the weather", msg.body)
+            self.assertIn("Could arrive: ~", msg.body)
 
     def test_north_wind_quiet(self):
         a, (lvl, msg) = self.run_case(m.Wind(5, 0), winds(5, 0))
@@ -230,6 +230,10 @@ def plume_at(bearing, km, half_km=20, density="light"):
     return square(la, lo, half_km, density)
 
 
+def assessment(current=20.0, place="Testville, KS"):
+    return m.Assessment(NOW, current, "test", 0, 8, current_ts=NOW // H * H - H, place=place)
+
+
 class SmokeTest(unittest.TestCase):
     def level(self, plumes, trajs=()):
         return m.assess_smoke(cfg(), plumes, list(trajs))
@@ -262,22 +266,22 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(sm.level, 1)
         self.assertIsNotNone(sm.incoming_eta)
         self.assertAlmostEqual((sm.incoming_eta - NOW) / H, 110 / 18, delta=1.5)  # 5 m/s = 18 km/h
-        msg = m.decide_smoke(cfg(), {"notified": 1}, sm, 20, NOW)
+        msg = m.decide_smoke(cfg(), {"notified": 1}, sm, assessment(), NOW)
         self.assertTrue(msg.title.startswith("Smoke may arrive"))
         north = m.back_trajectories(cfg(), NOW, winds(5, 0), 12)
         self.assertIsNone(self.level([plume_at(180, 150, half_km=40)], north).incoming_eta)
 
     def test_alert_flow(self):
         c, st = cfg(), {}
-        msg = m.decide_smoke(c, st, self.level([plume_at(180, 70)]), 20, NOW)
+        msg = m.decide_smoke(c, st, self.level([plume_at(180, 70)]), assessment(), NOW)
         self.assertIn("within 50 mi", msg.title)
-        self.assertIsNone(m.decide_smoke(c, st, self.level([plume_at(180, 140)]), 20, NOW + H))  # step down: quiet
-        self.assertIsNone(m.decide_smoke(c, st, self.level([plume_at(180, 70)]), 20, NOW + 2 * H))  # back up: no repeat
-        msg = m.decide_smoke(c, st, self.level([square(LAT, LON, 30)]), 20, NOW + 3 * H)
+        self.assertIsNone(m.decide_smoke(c, st, self.level([plume_at(180, 140)]), assessment(), NOW + H))  # step down: quiet
+        self.assertIsNone(m.decide_smoke(c, st, self.level([plume_at(180, 70)]), assessment(), NOW + 2 * H))  # back up: no repeat
+        msg = m.decide_smoke(c, st, self.level([square(LAT, LON, 30)]), assessment(), NOW + 3 * H)
         self.assertIn("overhead", msg.title)
-        self.assertIsNone(m.decide_smoke(c, st, self.level([]), 20, NOW + 4 * H))
-        msg = m.decide_smoke(c, st, self.level([]), 20, NOW + 8 * H)
-        self.assertEqual(msg.title, "Smoke plumes cleared")
+        self.assertIsNone(m.decide_smoke(c, st, self.level([]), assessment(), NOW + 4 * H))
+        msg = m.decide_smoke(c, st, self.level([]), assessment(), NOW + 8 * H)
+        self.assertEqual(msg.title, "Smoke plumes cleared  ||  ~Testville, KS")
         self.assertEqual(st["notified"], 0)
 
 

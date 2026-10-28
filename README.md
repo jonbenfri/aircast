@@ -47,7 +47,19 @@ Each poll (every 15 min by default):
    0.5 × within 50 mi + 0.25 × within 100 mi; light = 1, medium = 2, heavy = 3).
    It's flagged **incoming** when the back-trajectories start inside a plume
    within the next 12 h.
-9. **Alerts:**
+9. **Alerts.** Fields within a line are separated by `  ||  `, and each alert shows when
+   its readings were measured. Example:
+
+   ```
+   Possible AQI rise: 72 upwind, 206 mi SW  ||  ~Rochester, NY
+   Current AQI: 19  ||  1 PM ~ 1.5 hrs ago
+   Upwind: AQI 72 at Youngstown State, 206 mi SW  ||  12 PM ~ 2.5 hrs ago
+   Could arrive: ~Thu 8 AM
+   Wind (mph): 0–6h S 7  ||  6–12h S 16, gusts 39  ||  12–24h S 16
+   ```
+
+   Set `AQI_PLACE` for the title label and `TZ` (e.g. `America/New_York`) so times are local.
+   The alert types:
    - 👀 *Possible AQI rise: 45 upwind 99 mi S*: arrival time, scenario agreement,
      and the wind outlook at 0–6 h / 6–12 h / 12–24 h (mean, max and gusts in mph,
      so spikes stay visible)

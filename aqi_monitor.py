@@ -128,6 +128,7 @@ class Config:
     ntfy_topic: Optional[str] = None
     ntfy_token: Optional[str] = None
     ntfy_icon: Optional[str] = None
+    place: Optional[str] = None
     db_path: str = "aqi-monitor.db"
 
     @classmethod
@@ -170,6 +171,7 @@ class Config:
             ntfy_topic=_env("NTFY_TOPIC"),
             ntfy_token=_env("NTFY_TOKEN"),
             ntfy_icon=_env("NTFY_ICON"),
+            place=_env("AQI_PLACE"),
             db_path=_env("AQI_DB", "aqi-monitor.db"),
         )
 
@@ -309,9 +311,11 @@ def fetch_observation(cfg: Config) -> Optional[Tuple[int, float, str]]:
     if not rows:
         return None
     worst = max(rows, key=lambda r: r["AQI"])
-    # AirNow reports the hour of observation; the reading is current to within ~1h.
+    # This endpoint reports local observation hours without a usable offset; the reading is
+    # current to within ~1h, so stamp it with the start of this hour.
     ts = int(time.time()) // HOUR * HOUR
-    return ts, float(worst["AQI"]), f'{worst.get("ReportingArea", "?")} ({worst.get("ParameterName", "?")})'
+    area = ", ".join(x for x in (worst.get("ReportingArea"), worst.get("StateCode")) if x)
+    return ts, float(worst["AQI"]), area or "AirNow"
 
 
 @dataclass
@@ -320,6 +324,14 @@ class Station:
     lon: float
     aqi: float
     name: str
+    ts: Optional[int] = None  # start of the measured hour (UTC epoch)
+
+
+def _utc_hour(v: str) -> Optional[int]:
+    try:
+        return calendar.timegm(time.strptime(v[:13], "%Y-%m-%dT%H"))
+    except (ValueError, TypeError):
+        return None
 
 
 def nearest_observation(cfg: Config, stations: List["Station"]) -> Optional[Tuple[int, float, str]]:
@@ -336,7 +348,7 @@ def nearest_observation(cfg: Config, stations: List["Station"]) -> Optional[Tupl
     if best is None:
         return None
     (_, km), st = best
-    return int(time.time()) // HOUR * HOUR, st.aqi, f"{st.name}, {km / 1.609:.0f} mi"
+    return st.ts or int(time.time()) // HOUR * HOUR, st.aqi, f"{st.name}, {km / 1.609:.0f} mi"
 
 
 def fetch_stations(cfg: Config) -> List[Station]:
@@ -370,7 +382,8 @@ def fetch_stations(cfg: Config) -> List[Station]:
             continue
         key = (round(float(r["Latitude"]), 4), round(float(r["Longitude"]), 4))
         utc = str(r.get("UTC", ""))
-        st = Station(key[0], key[1], float(aqi), str(r.get("SiteName") or r.get("Parameter") or "?"))
+        st = Station(key[0], key[1], float(aqi), str(r.get("SiteName") or r.get("Parameter") or "?"),
+                     _utc_hour(utc))
         prev = latest.get(key)
         # Newest hour wins; within the same hour keep the worse pollutant.
         if prev is None or utc > prev[0] or (utc == prev[0] and st.aqi > prev[1].aqi):
@@ -566,6 +579,7 @@ class Threat:
     bearing: float
     eta: int
     support: float  # fraction of wind scenarios that bring it
+    obs_ts: Optional[int] = None  # when the source was measured (None for the model)
 
 
 def find_threats(cfg: Config, stations: List[Station], trajs: List[Trajectory],
@@ -574,9 +588,9 @@ def find_threats(cfg: Config, stations: List[Station], trajs: List[Trajectory],
     limit = cfg.threshold if cfg.watch_aqi is None else cfg.watch_aqi
     hits: Dict[str, Dict] = {}
 
-    def hit(key, aqi, name, lat, lon, ts, member):
+    def hit(key, aqi, name, lat, lon, ts, member, obs_ts=None):
         km, brg = distance_bearing(cfg.lat, cfg.lon, lat, lon)
-        h = hits.setdefault(key, {"aqi": aqi, "name": name, "km": km, "brg": brg,
+        h = hits.setdefault(key, {"aqi": aqi, "name": name, "km": km, "brg": brg, "obs_ts": obs_ts,
                                   "eta": None, "eta_any": ts, "members": set()})
         h["members"].add(member)
         h["eta_any"] = min(h["eta_any"], ts)
@@ -590,7 +604,7 @@ def find_threats(cfg: Config, stations: List[Station], trajs: List[Trajectory],
             r = 15 + 0.15 * path
             for st in stations:
                 if st.aqi > limit and math.hypot(*local_km(la, lo, st.lat, st.lon)) <= r:
-                    hit(f"{st.lat:.3f},{st.lon:.3f}", st.aqi, st.name, st.lat, st.lon, tr.ts, i)
+                    hit(f"{st.lat:.3f},{st.lon:.3f}", st.aqi, st.name, st.lat, st.lon, tr.ts, i, st.ts)
         v = (origin_model or {}).get(tr.ts)
         la, lo, path = tr.origins[0]
         if v is not None and v > limit and path >= 30:
@@ -598,7 +612,7 @@ def find_threats(cfg: Config, stations: List[Station], trajs: List[Trajectory],
             hit(f"model@{compass(brg)}", v, "model", la, lo, tr.ts, 0)
 
     out = [Threat(h["aqi"], h["name"], h["km"], h["brg"], h["eta"] or h["eta_any"],
-                  len(h["members"]) / len(SCENARIOS)) for h in hits.values()]
+                  len(h["members"]) / len(SCENARIOS), h["obs_ts"]) for h in hits.values()]
     return sorted(out, key=lambda t: -t.aqi * t.support)
 
 
@@ -639,6 +653,8 @@ class Assessment:
     surface: Dict[int, Wind] = field(default_factory=dict)
     trajs: List[Trajectory] = field(default_factory=list)
     smoke: Optional["Smoke"] = None
+    current_ts: Optional[int] = None  # when the current reading was measured; None = model estimate
+    place: str = ""
 
     @property
     def max_p(self) -> float:
@@ -667,15 +683,17 @@ def assess(cfg: Config, model: List[Tuple[int, float]], residuals: List[Tuple[in
     if model_now is None:
         raise ValueError("model series does not cover the current time")
     if observation is not None:
-        current, source = observation[1], f"AirNow, {observation[2]}"
+        current, source, current_ts = observation[1], f"AirNow, {observation[2]}", observation[0]
     else:
-        current, source = model_now + bias, "model"
+        current, source, current_ts = model_now + bias, "model", None
 
     if trajs is None:
         trajs = back_trajectories(cfg, now, wind_hourly or {}, max(cfg.watch_hours, cfg.horizon_hours))
     by_ts = {tr.ts: tr for tr in trajs}
     a = Assessment(now=int(now), current=current, current_source=source, bias=bias,
-                   sigma0=sigma0, wind_now=wind_now, surface=wind_hourly or {}, trajs=trajs)
+                   sigma0=sigma0, wind_now=wind_now, surface=wind_hourly or {}, trajs=trajs,
+                   current_ts=current_ts,
+                   place=cfg.place or (observation[2].split(",")[0] if observation else ""))
     a.threats = find_threats(cfg, stations or [], [t for t in trajs if t.lead_h <= cfg.watch_hours],
                              origin_model)
     if plumes is not None:
@@ -953,11 +971,24 @@ def smoke_details(sm: Smoke) -> str:
     return "Smoke plumes " + "; ".join(parts) + "."
 
 
-def decide_smoke(cfg: Config, st: Dict[str, float], sm: Smoke, aqi_now: float,
+def smoke_line(sm: Smoke) -> str:
+    items = []
+    if sm.overhead:
+        k = len(sm.overhead)
+        items.append(f"{k} {'plume' if k == 1 else 'plumes'} overhead ({', '.join(sm.overhead)})")
+        items.append(f"{sm.n50} within 50 mi")
+    else:
+        items.append(f"{sm.n50} {'plume' if sm.n50 == 1 else 'plumes'} within 50 mi")
+    items.append(f"{sm.n100} at 50–100 mi")
+    items.append(f"score {sm.score:.1f}")
+    return "Smoke: " + SEP.join(items)
+
+
+def decide_smoke(cfg: Config, st: Dict[str, float], sm: Smoke, a: Assessment,
                  now: float) -> Optional["Message"]:
     """st holds notified (level last alerted), incoming (0/1), below_since. Mutated in place."""
-    when = f" (NOAA HMS analysis {_fmt_time(sm.analysed)})" if sm.analysed else ""
-    tail = f" AQI now {aqi_now:.0f}. Satellite smoke may be aloft; AQI doesn't measure smoke VOCs.{when}"
+    sat = f"🌎🛰️ {as_of(sm.analysed, now)}" if sm.analysed else ""
+    wind = wind_outlook(a)
     notified = int(st.get("notified", 0))
     if sm.level > notified:
         st.update(notified=sm.level, below_since=0)
@@ -971,9 +1002,9 @@ def decide_smoke(cfg: Config, st: Dict[str, float], sm: Smoke, aqi_now: float,
         arrive = ""
         if sm.incoming_eta and sm.level < 3 and not st.get("incoming"):
             st["incoming"] = 1
-            arrive = (f" Forecast winds may bring it here ~{_fmt_time(sm.incoming_eta)} "
-                      f"({sm.incoming_support * len(SCENARIOS):.0f}/{len(SCENARIOS)} wind scenarios).")
-        return Message(title, smoke_details(sm) + arrive + tail, {1: 2, 2: 3, 3: 3, 4: 4}[sm.level], "fog")
+            arrive = f"May arrive: ~{clock(sm.incoming_eta, now)}"
+        return Message(headline(title, a), _body(current_line(a), smoke_line(sm), arrive, sat, wind),
+                       {1: 2, 2: 3, 3: 3, 4: 4}[sm.level], "fog")
     if sm.level < notified:
         # Only step down after the lower level has held for a while: plumes jitter between analyses.
         if not st.get("below_since"):
@@ -982,19 +1013,20 @@ def decide_smoke(cfg: Config, st: Dict[str, float], sm: Smoke, aqi_now: float,
             st.update(notified=sm.level, below_since=0)
             if sm.level == 0:
                 st["incoming"] = 0
-                return Message("Smoke plumes cleared",
-                               f"No satellite smoke plume within 100 mi for {cfg.smoke_clear_hours:.0f}h.",
+                return Message(headline("Smoke plumes cleared", a),
+                               _body(current_line(a),
+                                     f"No satellite smoke plume within 100 mi for {cfg.smoke_clear_hours:g}h.",
+                                     sat, wind),
                                2, "white_check_mark")
     else:
         st["below_since"] = 0
     if sm.incoming_eta and not st.get("incoming") and sm.level < 3:
         st["incoming"] = 1
         return Message(
-            f"Smoke may arrive ~{_fmt_time(sm.incoming_eta)}",
-            (f"Forecast winds bring air from inside a {sm.incoming_density} smoke plume now "
-             f"~{sm.incoming_km / MI:.0f} mi {compass(sm.incoming_brg)} "
-             f"({sm.incoming_support * len(SCENARIOS):.0f}/{len(SCENARIOS)} wind scenarios). "
-             + smoke_details(sm) + tail),
+            headline(f"Smoke may arrive ~{clock(sm.incoming_eta, now)}", a),
+            _body(current_line(a),
+                  f"From a {sm.incoming_density} plume now ~{sm.incoming_km / MI:.0f} mi {compass(sm.incoming_brg)}",
+                  smoke_line(sm), sat, wind),
             3, "fog")
     return None
 
@@ -1038,6 +1070,38 @@ def _fmt_time(ts: int) -> str:
     return time.strftime("%a %H:%M", time.localtime(ts))
 
 
+SEP = "  ||  "  # separates fields within a message line
+
+
+def clock(ts: float, now: float) -> str:
+    """'1 PM', '11:49 AM', or 'Thu 8 AM' when it's not today (local time; set TZ)."""
+    t, n = time.localtime(ts), time.localtime(now)
+    hm = time.strftime("%I:%M %p", t).lstrip("0").replace(":00 ", " ")
+    return hm if t[:3] == n[:3] else f"{time.strftime('%a', t)} {hm}"
+
+
+def ago(ts: float, now: float) -> str:
+    mins = max(0.0, (now - ts) / 60)
+    if mins < 60:
+        return f"{mins:.0f} min ago"
+    hrs = round(mins / 30) / 2
+    return f"{hrs:g} hr ago" if hrs == 1 else f"{hrs:g} hrs ago"
+
+
+def as_of(ts: float, now: float) -> str:
+    return f"{clock(ts, now)} ~ {ago(ts, now)}"
+
+
+def headline(title: str, a: Assessment) -> str:
+    return f"{title}{SEP}~{a.place}" if a.place else title
+
+
+def current_line(a: Assessment) -> str:
+    if a.current_ts is None:
+        return f"Current AQI: ~{a.current:.0f} (model estimate){SEP}no monitor in range"
+    return f"Current AQI: {a.current:.0f}{SEP}{as_of(a.current_ts, a.now)}"
+
+
 def wind_text(a: Assessment) -> str:
     w = a.wind_now
     if w is None:
@@ -1052,19 +1116,22 @@ def wind_text(a: Assessment) -> str:
 
 def wind_outlook(a: Assessment) -> str:
     """Several time scales so a short spike isn't hidden by averaging, e.g.
-    'Wind (mph) 0-6h: S 4 (max 6); 6-12h: S 9 (max 12); 12-24h: SW 13 (max 15, gusts 24).'"""
+    'Wind (mph): 0–6h S 7  ||  6–12h S 9, max 16, gusts 39  ||  12–24h S 16'."""
     parts = []
     for lo, hi in ((0, 6), (6, 12), (12, 24)):
         ws = [w for t, w in sorted(a.surface.items()) if a.now + lo * HOUR < t <= a.now + hi * HOUR]
         if not ws:
             continue
         m = mean_wind(ws)
-        txt = f"{lo}-{hi}h: {compass(m.direction)} {m.speed * MPH:.0f} (max {max(w.speed for w in ws) * MPH:.0f}"
+        mean, peak = m.speed * MPH, max(w.speed for w in ws) * MPH
+        txt = f"{lo}–{hi}h {compass(m.direction)} {mean:.0f}"
+        if peak >= mean + 5:
+            txt += f", max {peak:.0f}"
         gusts = [w.gust for w in ws if w.gust is not None]
-        if gusts and max(gusts) >= 1.5 * max(w.speed for w in ws):
+        if gusts and max(gusts) * MPH >= 1.5 * peak:
             txt += f", gusts {max(gusts) * MPH:.0f}"
-        parts.append(txt + ")")
-    return ("Wind (mph) " + "; ".join(parts) + ".") if parts else ""
+        parts.append(txt)
+    return ("Wind (mph): " + SEP.join(parts)) if parts else ""
 
 
 def threat_text(t: Threat) -> str:
@@ -1072,41 +1139,55 @@ def threat_text(t: Threat) -> str:
     return f"AQI {t.aqi:.0f} ({where}) {t.km / MI:.0f} mi {compass(t.bearing)}"
 
 
+def _body(*lines: str) -> str:
+    return "\n".join(line for line in lines if line)
+
+
 def decide(cfg: Config, prev: str, last_notified: float, a: Assessment) -> Tuple[str, Optional[Message]]:
     """Return (new_level, message-to-send-or-None)."""
     level = next_level(cfg, prev, a)
-    thr = int(cfg.threshold)
+    thr, hz = int(cfg.threshold), cfg.horizon_hours
     peak = a.peak
-    peak_txt = f"Peak ~{peak.corrected:.0f} around {_fmt_time(peak.ts)}." if peak else ""
-    peak_txt = f"{peak_txt} {wind_text(a)}".strip()
+    wind = wind_outlook(a)
 
     if level == NOW and (prev != NOW or (cfg.remind_hours > 0 and a.now - last_notified >= cfg.remind_hours * HOUR)):
         return level, Message(
-            title=f"AQI {a.current:.0f} - above {thr} now",
-            body=f"Current AQI {a.current:.0f} ({a.current_source}). {peak_txt}".strip(),
-            priority=4, tags="rotating_light")
+            headline(f"AQI {a.current:.0f}, above {thr}", a),
+            _body(current_line(a),
+                  f"Next {hz}h: peak ~{peak.corrected:.0f} around {clock(peak.ts, a.now)}" if peak else "",
+                  wind),
+            4, "rotating_light")
     if level == FORECAST and RANK[prev] < RANK[FORECAST]:
         first = a.first_exceed(cfg.alert_prob)
-        when = _fmt_time(first.ts) if first else "soon"
+        when = clock(first.ts, a.now) if first else "soon"
         return level, Message(
-            title=f"AQI may exceed {thr} by {when}",
-            body=(f"Now {a.current:.0f}. Estimated chance of >{thr} within {cfg.horizon_hours}h: "
-                  f"{a.max_p:.0%}. {peak_txt} {wind_outlook(a)}").strip(),
-            priority=3, tags="warning")
+            headline(f"AQI may exceed {thr} by {when}", a),
+            _body(current_line(a),
+                  f"Chance above {thr} in next {hz}h: {a.max_p:.0%}",
+                  f"Peak: ~{peak.corrected:.0f} around {clock(peak.ts, a.now)}" if peak else "",
+                  wind),
+            3, "warning")
     if level == WATCH and RANK[prev] < RANK[WATCH]:
         t = a.threats[0]
+        where = f"{t.km / MI:.0f} mi {compass(t.bearing)}"
+        if t.name == "model":
+            src = f"Upwind: AQI ~{t.aqi:.0f} (model), {where}{SEP}model forecast"
+        else:
+            src = f"Upwind: AQI {t.aqi:.0f} at {t.name}, {where}"
+            if t.obs_ts:
+                src += f"{SEP}{as_of(t.obs_ts, a.now)}"
         return level, Message(
-            title=f"Possible AQI rise: {t.aqi:.0f} upwind {t.km / MI:.0f} mi {compass(t.bearing)}",
-            body=(f"Now {a.current:.0f}. {threat_text(t)}. Forecast winds bring that air here "
-                  f"~{_fmt_time(t.eta)} if it persists ({t.support * len(SCENARIOS):.0f}/{len(SCENARIOS)} "
-                  f"wind scenarios). {wind_outlook(a)} Check the weather.").replace("  ", " "),
-            priority=3, tags="eyes")
+            headline(f"Possible AQI rise: {t.aqi:.0f} upwind, {where}", a),
+            _body(current_line(a), src, f"Could arrive: ~{clock(t.eta, a.now)}", wind),
+            3, "eyes")
     if level == CLEAR and prev != CLEAR:
-        body = (f"Below {thr} and not expected to exceed it in the next {cfg.horizon_hours}h."
-                if prev != WATCH else "Upwind air has cleared or the wind has shifted away.")
-        return level, Message(
-            title=f"AQI back to {a.current:.0f}" if prev != WATCH else f"Upwind watch over (AQI {a.current:.0f})",
-            body=body, priority=2, tags="white_check_mark")
+        if prev == WATCH:
+            return level, Message(headline("Upwind watch over", a),
+                                  _body(current_line(a), "Upwind air has cleared or the wind has shifted away.", wind),
+                                  2, "white_check_mark")
+        return level, Message(headline(f"AQI back to {a.current:.0f}", a),
+                              _body(current_line(a), f"Not expected above {thr} in the next {hz}h.", wind),
+                              2, "white_check_mark")
     return level, None
 
 
@@ -1214,8 +1295,9 @@ def tick(cfg: Config, store: Store, send: bool = True) -> Assessment:
     a = assess(cfg, model, store.residuals(now - 7 * 24 * HOUR), obs, now, wind_now, surface,
                ring, stations, trajs, origin_model, plumes)
     peak = a.peak
-    log.info("current=%.0f (%s) bias=%+.1f sigma0=%.1f max_p=%.0f%% peak=%s %s",
-             a.current, a.current_source, a.bias, a.sigma0, a.max_p * 100,
+    log.info("current=%.0f (%s, as of %s) bias=%+.1f sigma0=%.1f max_p=%.0f%% peak=%s %s",
+             a.current, a.current_source, as_of(a.current_ts, now) if a.current_ts else "n/a",
+             a.bias, a.sigma0, a.max_p * 100,
              f"{peak.corrected:.0f}@+{peak.lead_h:.0f}h" if peak else "n/a", wind_text(a))
     for t in a.threats[:3]:
         log.info("upwind: %s, eta %s (%.0f%% of scenarios)", threat_text(t), _fmt_time(t.eta), t.support * 100)
@@ -1226,7 +1308,7 @@ def tick(cfg: Config, store: Store, send: bool = True) -> Assessment:
 
     if a.smoke is not None:
         st = {k: float(store.get("smoke_" + k, "0")) for k in ("notified", "incoming", "below_since")}
-        smsg = decide_smoke(cfg, st, a.smoke, a.current, now)
+        smsg = decide_smoke(cfg, st, a.smoke, a, now)
         if smsg:
             notify(cfg, smsg)
         for k, v in st.items():
