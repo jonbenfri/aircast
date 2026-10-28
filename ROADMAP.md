@@ -41,6 +41,13 @@ Ideas and open items, roughly in priority order.
   rising first along the back-trajectories, and agreement with HMS smoke / PM2.5 / ozone.
 
 ## Forecasting
-- Replace the simple bias average with a proper Kalman filter (as in NOAA's KFAN).
-- Log predictions vs. outcomes, to score against validated EPA AQS data later
-  (needed for any publication; AirNow data is preliminary).
+- ~~Log predictions vs. outcomes; learned per-lead bias; `score` command~~ (done).
+- ~~Dilution in concentration space; winds at three heights; mixing height / inversions~~ (done).
+- Calibrate `AQI_DILUTION_KM` and the probability spread from logged data once a season is in.
+- Second forecast model (Google Air Quality API needs billing; NOAA HRRR-Smoke needs GRIB2 processing).
+- Score against validated EPA AQS data (needed for any publication; AirNow data is preliminary).
+- Upgrade the bias average to a Kalman filter (NOAA KFAN-style) only if the scores show it's needed.
+
+## Someday
+- Symptom tracker: log how you feel alongside AQI, smoke level and mixing, to learn personal
+  thresholds. Possibly a separate health app; out of scope for now.

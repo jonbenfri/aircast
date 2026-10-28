@@ -20,17 +20,31 @@ Each poll (every 15 min by default):
    for its air-quality forecasts (see *Prior work*).
 3. **Wind, model upwind:** model AQI on a 50 km ring around you. For each hour,
    the ring point the wind blows *from* pulls the forecast toward its value.
-4. **Back-trajectories:** for every hour in the next 24 h, the air that will
-   arrive is traced backwards through the hourly forecast winds to where it is
-   now. The transport wind is the mean of the 10 m and 850 hPa winds. Nothing is
-   smoothed, so a 3-hour wind spike or a wind shift counts where it happens. Five
-   wind scenarios are traced (forecast as-is, direction ±20°, speed ×0.7 and ×1.3),
-   and their disagreement widens the uncertainty.
-5. **Upwind monitors:** AirNow monitors (PM2.5, PM10, ozone, CO, NO₂) within
-   ~155 mi near each trajectory's starting point tell what air is on its way,
-   assuming it persists. This catches wildfire smoke the model misses.
-6. **Uncertainty:** σ grows with lead time, with scenario spread and model/upwind
-   disagreement, and in calm air (stagnation). `P(exceed) = 1 − Φ((35 − forecast)/σ)`.
+4. **Back-trajectories at three heights:** for every hour in the next 24 h, the air
+   that will arrive is traced backwards through the hourly forecast winds to where
+   it is now. Nothing is smoothed, so a 3-hour wind spike or a wind shift counts
+   where it happens. Near-ground air uses the mean of the 10 m and 850 hPa
+   (~5,000 ft) winds; smoke plumes are also traced on 700 hPa (~10,000 ft) winds,
+   where most long-range smoke travels. Five wind scenarios are traced (forecast
+   as-is, direction ±20°, speed ×0.7 and ×1.3), and their disagreement widens the
+   uncertainty.
+5. **Upwind monitors, diluted on the way:** AirNow monitors (PM2.5, PM10, ozone,
+   CO, NO₂) within ~155 mi near each trajectory's starting point tell what air is
+   on its way. Readings are converted to PM2.5-equivalent µg/m³ (EPA 2024 AQI
+   breakpoints), and their excess over local air shrinks with distance travelled,
+   `excess × exp(−distance / 400 km)` (`AQI_DILUTION_KM`), before converting back.
+6. **Mixing height and inversions:** the forecast boundary-layer height says
+   whether smoke aloft can reach the ground (deep mixing on sunny afternoons) or
+   stays up (shallow at night). Shallow mixing plus light wind is treated as an
+   inversion that traps local pollution, which widens the uncertainty.
+6b. **Learned correction:** every forecast hour is logged and later matched
+   with what AirNow measured. The average error at each lead time (0–3, 3–6,
+   6–12, 12–24 h) is added back, shrunk toward zero while data is scarce:
+   `n / (n + 50) × mean error`. No neural networks: just averages.
+   `aircast.py score` prints errors by lead time, hits, misses, false alarms
+   and calibration ("when it said 60–80%, it happened X% of the time").
+6c. **Uncertainty:** σ grows with lead time, with scenario spread and model/upwind
+   disagreement, and in calm air or inversions. `P(exceed) = 1 − Φ((35 − forecast)/σ)`.
 7. **Upwind watch:** if any monitor (or the model where the trajectories start)
    reads above 35 and forecast winds bring that air to you within 24 h, you get
    a heads-up with an arrival time and how many wind scenarios agree.
@@ -50,8 +64,10 @@ Each poll (every 15 min by default):
    Each alert lists plumes overhead, within 50 mi and within 50–100 mi, the nearest
    plume's distance and direction, and a score (overhead density weights +
    0.5 × within 50 mi + 0.25 × within 100 mi + 0.125 × within 200 mi; light = 1, medium = 2, heavy = 3).
-   It's flagged **incoming** when the back-trajectories start inside a plume
-   within the next 24 h (`AQI_WATCH_HOURS`).
+   It's flagged **incoming** when the back-trajectories (near-ground or aloft)
+   start inside a plume within the next 24 h (`AQI_WATCH_HOURS`). Overhead and
+   incoming alerts include the mixing height, so you can tell whether smoke aloft
+   is likely to reach the ground.
 9. **Alerts.** Fields within a line are separated by `  ||  `, and each alert shows when
    its readings were measured. Example:
 

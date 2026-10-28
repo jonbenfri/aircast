@@ -360,3 +360,85 @@ class StateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DilutionTest(unittest.TestCase):
+    def test_aqi_pm_roundtrip(self):
+        self.assertAlmostEqual(m.pm_to_aqi(9.0), 50)
+        self.assertAlmostEqual(m.aqi_to_pm(100), 35.4)
+        for aqi in (0, 19, 35, 72, 151, 250, 420):
+            self.assertAlmostEqual(m.pm_to_aqi(m.aqi_to_pm(aqi)), aqi, places=6)
+
+    def test_dilute(self):
+        c = cfg()
+        self.assertAlmostEqual(m.dilute(c, 72, 19, 0), 72)
+        self.assertAlmostEqual(m.dilute(c, 72, 19, 1e6), 19, places=3)
+        mid = m.dilute(c, 72, 19, 330)  # ~Youngstown distance
+        self.assertTrue(19 < mid < 72)
+        self.assertLess(m.dilute(c, 72, 19, 400), mid)
+
+    def test_threat_reports_diluted_arrival(self):
+        stations = [station(180, 160, 45)]
+        a = m.assess(cfg(), flat(15), [], None, NOW, m.Wind(5, 180), winds(5, 180), None, stations)
+        t = a.threats[0]
+        self.assertEqual(t.aqi, 45)                 # watch still fires on the upwind reading
+        self.assertTrue(15 < t.arrive_aqi < 45)     # but says what to expect here
+
+
+class MixingTest(unittest.TestCase):
+    def test_mixing_text(self):
+        self.assertIn("deep", m.mixing_text(2000))
+        self.assertIn("moderate", m.mixing_text(800))
+        self.assertIn("shallow", m.mixing_text(150))
+        self.assertEqual(m.mixing_text(None), "")
+
+    def test_inversion_widens_uncertainty(self):
+        def run(mix):
+            blh = {t: mix for t, _ in flat(0)}
+            a = m.assess(cfg(), flat(25), [], None, NOW, m.Wind(0.5, 0), winds(0.5, 0), None, [],
+                         None, None, None, None, blh)
+            return a.hours[3].sigma
+        self.assertGreater(run(100), run(1500))
+
+    def test_smoke_incoming_on_winds_aloft(self):
+        """Near-ground air comes from the north, but winds aloft bring a plume from the south."""
+        low = m.back_trajectories(cfg(), NOW, winds(4, 0), 24)
+        aloft = m.back_trajectories(cfg(), NOW, winds(10, 180), 24)
+        blh = {t: 1800.0 for t, _ in flat(0)}
+        sm = m.assess_smoke(cfg(), [plume_at(180, 250, half_km=60)], low, aloft, blh, NOW)
+        self.assertEqual(sm.incoming_layer, "aloft")
+        self.assertIsNotNone(sm.incoming_eta)
+        self.assertEqual(sm.incoming_mix, 1800.0)
+        msg = m.decide_smoke(cfg(), {}, sm, assessment(), NOW)
+        self.assertIn("winds aloft", msg.body)
+        self.assertIn("Mixing: deep", msg.body)
+
+
+class LearningTest(unittest.TestCase):
+    def test_learn_and_apply_bias(self):
+        store = m.Store(":memory:")
+        # 100 past forecasts that were consistently 10 AQI too low at 1-3h lead.
+        for k in range(100):
+            issued = NOW - (200 - k) * H
+            valid = issued + 2 * H
+            store.db.execute("INSERT INTO forecast VALUES (?,?,?,?,?,?,?,?)",
+                             (issued, valid, 2.0, 20, 20, 20, 8, 0.05))
+            store.add_residual(valid, 30.0, 20.0)
+        learned = store.learned(NOW - 30 * 24 * H)
+        n, bias, rmse = learned[m.lead_bucket(2)]
+        self.assertEqual((n, bias), (100, 10.0))
+        a = m.assess(cfg(use_wind=False), flat(20), [], None, NOW,
+                     learned=learned)
+        h = next(h for h in a.hours if round(h.lead_h) == 2)
+        self.assertAlmostEqual(h.corrected - h.base, 10 * 100 / 150, places=6)  # shrunk by n/(n+50)
+
+    def test_score_runs(self):
+        import contextlib, io as _io
+        store = m.Store(":memory:")
+        store.db.execute("INSERT INTO forecast VALUES (?,?,?,?,?,?,?,?)",
+                         (NOW - 5 * H, NOW - 3 * H, 2.0, 20, 20, 40, 8, 0.7))
+        store.add_residual(NOW - 3 * H, 45.0, 20.0)
+        out = _io.StringIO()
+        with contextlib.redirect_stdout(out):
+            m.print_score(cfg(), store, 1e6)
+        self.assertIn("hits 1", out.getvalue())
