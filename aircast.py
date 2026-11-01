@@ -120,7 +120,8 @@ class Config:
     transport: str = "mixed"
     smoke: bool = True
     hms_url: Optional[str] = None
-    smoke_clear_hours: float = 3.0
+    smoke_clear_hours: float = 6.0
+    hms_keep_hours: float = 12.0
     smoke_far_mi: float = 200.0
     dilution_km: float = 400.0
     learn: bool = True
@@ -168,7 +169,8 @@ class Config:
             transport=_env("AQI_TRANSPORT", "mixed"),
             smoke=_env("AQI_SMOKE", "1") not in ("0", "false", "no"),
             hms_url=_env("AQI_HMS_URL"),
-            smoke_clear_hours=f("AQI_SMOKE_CLEAR_HOURS", 3),
+            smoke_clear_hours=f("AQI_SMOKE_CLEAR_HOURS", 6),
+            hms_keep_hours=f("AQI_HMS_KEEP_HOURS", 12),
             smoke_far_mi=f("AQI_SMOKE_FAR_MI", 200),
             dilution_km=f("AQI_DILUTION_KM", 400),
             learn=_env("AQI_LEARN", "1") not in ("0", "false", "no"),
@@ -973,11 +975,14 @@ def fetch_hms(cfg: Config, now: float) -> List[Plume]:
                     raise
     if not found:
         raise RuntimeError("no HMS smoke file found for today or yesterday")
-    # Keep the latest analysis: plumes ending within 6h of the newest one, and not older than 36h.
+    # Keep recent analyses: plumes ending within hms_keep_hours of the newest one, and not older
+    # than 36h. Each analysis covers only the plumes analysts could see then (clouds hide smoke,
+    # an early analysis may cover part of the map), so one sparse analysis must not wipe out the rest.
     ends = [p.end for p in plumes if p.end]
     if ends:
         latest = max(ends)
-        plumes = [p for p in plumes if p.end and p.end >= latest - 6 * HOUR and latest >= now - 36 * HOUR]
+        plumes = [p for p in plumes
+                  if p.end and p.end >= latest - cfg.hms_keep_hours * HOUR and latest >= now - 36 * HOUR]
     _HMS_CACHE.update(fetched=now, plumes=plumes)
     return plumes
 
@@ -1259,7 +1264,8 @@ def _num(x: float) -> str:
 
 def decide_smoke(cfg: Config, st: Dict[str, float], sm: Smoke, a: Assessment,
                  now: float) -> Optional["Message"]:
-    """st holds notified (level last alerted), incoming (0/1), below_since. Mutated in place."""
+    """st holds notified (level last alerted), incoming (0/1), below_since, below_analysed
+    (HMS analysis time when the drop started). Mutated in place."""
     sat = f"🛰️🌎🛰️ {as_of(sm.analysed, now)}" if sm.analysed else ""
     wind = wind_outlook(a)
     notified = int(st.get("notified", 0))
@@ -1282,19 +1288,22 @@ def decide_smoke(cfg: Config, st: Dict[str, float], sm: Smoke, a: Assessment,
                        {1: 2, 2: 3, 3: 3, 4: 3, 5: 4}[sm.level], "fog")
     if sm.level < notified:
         # Only step down after the lower level has held for a while: plumes jitter between analyses.
+        # Clearing to 0 also needs a newer satellite analysis that still shows no smoke.
         if not st.get("below_since"):
-            st["below_since"] = now
-        elif now - st["below_since"] >= cfg.smoke_clear_hours * HOUR:
-            st.update(notified=sm.level, below_since=0)
+            st.update(below_since=now, below_analysed=sm.analysed or 0)
+        elif (now - st["below_since"] >= cfg.smoke_clear_hours * HOUR
+              and (sm.level > 0 or not sm.analysed or sm.analysed > st.get("below_analysed", 0))):
+            st.update(notified=sm.level, below_since=0, below_analysed=0)
             if sm.level == 0:
                 st["incoming"] = 0
                 return Message(headline("Smoke plumes cleared", a),
                                _body(current_line(a),
-                                     f"No satellite smoke plume within {cfg.smoke_far_mi:.0f} mi for {cfg.smoke_clear_hours:g}h.",
+                                     f"No satellite smoke plume within {cfg.smoke_far_mi:.0f} mi for {cfg.smoke_clear_hours:g}h"
+                                     f"{SEP}clouds can hide smoke from the satellite",
                                      sat, wind),
                                2, "white_check_mark")
     else:
-        st["below_since"] = 0
+        st.update(below_since=0, below_analysed=0)
     if sm.incoming_eta and not st.get("incoming") and sm.level < 4:
         st["incoming"] = 1
         return Message(
@@ -1305,6 +1314,16 @@ def decide_smoke(cfg: Config, st: Dict[str, float], sm: Smoke, a: Assessment,
                   smoke_line(sm), mixing_text(sm.incoming_mix), sat, wind),
             3, "fog")
     return None
+
+
+def smoke_status(cfg: Config, a: "Assessment") -> str:
+    """Smoke line for AQI messages, so every alert says what the satellite shows."""
+    if not cfg.smoke:
+        return ""
+    if a.smoke is None:
+        return "Smoke: satellite data unavailable"
+    sat = f"{SEP}🛰️🌎🛰️ {as_of(a.smoke.analysed, a.now)}" if a.smoke.analysed else ""
+    return smoke_line(a.smoke) + sat
 
 
 def incoming_layer_text(sm: Smoke) -> str:
@@ -1428,7 +1447,7 @@ def decide(cfg: Config, prev: str, last_notified: float, a: Assessment) -> Tuple
     level = next_level(cfg, prev, a)
     thr, hz = int(cfg.threshold), cfg.horizon_hours
     peak = a.peak
-    wind = wind_outlook(a)
+    wind = _body(smoke_status(cfg, a), wind_outlook(a))
 
     if level == NOW and (prev != NOW or (cfg.remind_hours > 0 and a.now - last_notified >= cfg.remind_hours * HOUR)):
         return level, Message(
@@ -1624,7 +1643,7 @@ def tick(cfg: Config, store: Store, send: bool = True) -> Assessment:
     store.log_forecast(a, cfg.log_days)
 
     if a.smoke is not None:
-        st = {k: float(store.get("smoke_" + k, "0")) for k in ("notified", "incoming", "below_since")}
+        st = {k: float(store.get("smoke_" + k, "0")) for k in ("notified", "incoming", "below_since", "below_analysed")}
         smsg = decide_smoke(cfg, st, a.smoke, a, now)
         if smsg:
             notify(cfg, smsg)

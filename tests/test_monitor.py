@@ -318,9 +318,30 @@ class SmokeTest(unittest.TestCase):
         msg = m.decide_smoke(c, st, self.level([square(LAT, LON, 30)]), assessment(), NOW + 3 * H)
         self.assertIn("overhead", msg.title)
         self.assertIsNone(m.decide_smoke(c, st, self.level([]), assessment(), NOW + 4 * H))
-        msg = m.decide_smoke(c, st, self.level([]), assessment(), NOW + 8 * H)
+        msg = m.decide_smoke(c, st, self.level([]), assessment(), NOW + 11 * H)
         self.assertEqual(msg.title, "Smoke plumes cleared  ||  ~Testville, KS")
         self.assertEqual(st["notified"], 0)
+
+    def test_no_clear_without_newer_analysis(self):
+        """Smoke elsewhere in the analysis but none near: clear only after a newer analysis agrees."""
+        c, st = cfg(), {}
+        far = square(LAT + 20, LON, 20)  # ~1400 mi N
+        m.decide_smoke(c, st, self.level([plume_at(180, 70)]), assessment(), NOW)
+        self.assertIsNone(m.decide_smoke(c, st, self.level([far]), assessment(), NOW + H))
+        self.assertIsNone(m.decide_smoke(c, st, self.level([far]), assessment(), NOW + 12 * H))  # same analysis
+        self.assertEqual(st["notified"], 3)
+        newer = m.Plume("light", None, NOW + 6 * H, far.rings, far.bbox)
+        msg = m.decide_smoke(c, st, self.level([newer]), assessment(), NOW + 13 * H)
+        self.assertTrue(msg.title.startswith("Smoke plumes cleared"))
+
+    def test_aqi_messages_show_smoke(self):
+        a = assessment()
+        a.smoke = self.level([plume_at(180, 70)])
+        _, msg = m.decide(cfg(), m.FORECAST, 0, a)  # forecast -> clear
+        self.assertIn("Smoke: 1 plume within 200 mi", msg.body)
+        a.smoke = None
+        _, msg = m.decide(cfg(), m.FORECAST, 0, a)
+        self.assertIn("Smoke: satellite data unavailable", msg.body)
 
 
 def _shapefile_zip(polys):
