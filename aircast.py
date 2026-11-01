@@ -1634,7 +1634,10 @@ def tick(cfg: Config, store: Store, send: bool = True) -> Assessment:
     for t in a.threats[:3]:
         log.info("upwind: %s, eta %s (%.0f%% of scenarios)", threat_text(t), _fmt_time(t.eta), t.support * 100)
     if a.smoke is not None:
-        log.info("smoke: level %d (%s). %s", a.smoke.level, SMOKE_NAMES[a.smoke.level], smoke_details(a.smoke))
+        log.info("smoke: level %d (%s). %s HMS: %d polygons kept, oldest %s, newest %s.",
+                 a.smoke.level, SMOKE_NAMES[a.smoke.level], smoke_details(a.smoke), len(plumes or []),
+                 _fmt_time(min((p.end for p in plumes or [] if p.end), default=0)) if plumes else "n/a",
+                 _fmt_time(a.smoke.analysed) if a.smoke.analysed else "n/a")
     if a.learned:
         log.info("learned: %s", learned_text(cfg, a.learned))
     if not send:
