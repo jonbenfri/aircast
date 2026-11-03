@@ -123,6 +123,7 @@ class Config:
     smoke_clear_hours: float = 6.0
     hms_keep_hours: float = 12.0
     smoke_far_mi: float = 200.0
+    aod_smoke: float = 0.4
     dilution_km: float = 400.0
     learn: bool = True
     learn_shrink: float = 50.0
@@ -172,6 +173,7 @@ class Config:
             smoke_clear_hours=f("AQI_SMOKE_CLEAR_HOURS", 6),
             hms_keep_hours=f("AQI_HMS_KEEP_HOURS", 12),
             smoke_far_mi=f("AQI_SMOKE_FAR_MI", 200),
+            aod_smoke=f("AQI_AOD_SMOKE", 0.4),
             dilution_km=f("AQI_DILUTION_KM", 400),
             learn=_env("AQI_LEARN", "1") not in ("0", "false", "no"),
             learn_shrink=f("AQI_LEARN_SHRINK", 50),
@@ -212,6 +214,46 @@ def fetch_model(cfg: Config) -> List[Tuple[int, float]]:
         "timeformat": "unixtime",
     })
     return _parse_series(data["hourly"], "us_aqi")
+
+
+def fetch_aod(cfg: Config) -> List[Tuple[int, float]]:
+    """Hourly (unix_ts, aerosol optical depth at 550 nm) from the CAMS model via Open-Meteo.
+    How much smoke/haze is in the whole column overhead; a model, so clouds don't hide it."""
+    data = _get_json(OPEN_METEO_URL, {
+        "latitude": cfg.lat,
+        "longitude": cfg.lon,
+        "hourly": "aerosol_optical_depth",
+        "forecast_days": 2,
+        "timeformat": "unixtime",
+    })
+    return _parse_series(data["hourly"], "aerosol_optical_depth")
+
+
+# Aerosol optical depth: ~0.1 is clean air; wildfire smoke days run from ~0.4 to well over 1.
+AOD_LEVELS = [(0.8, "heavy"), (0.4, "moderate"), (0.2, "light"), (0.0, "little")]
+
+
+def aod_name(aod: float) -> str:
+    return next(name for lo, name in AOD_LEVELS if aod >= lo)
+
+
+def aod_line(a: "Assessment") -> str:
+    """e.g. 'Smoke/haze (model): light, AOD 0.25  ||  moderate ~Tue 3 PM (0.55)'."""
+    if a.aod_now is None:
+        return ""
+    line = f"Smoke/haze (model): {aod_name(a.aod_now)}, AOD {a.aod_now:.2f}"
+    rank = [name for _, name in reversed(AOD_LEVELS)]
+    if (a.aod_peak is not None and a.aod_peak_ts
+            and rank.index(aod_name(a.aod_peak)) > rank.index(aod_name(a.aod_now))):
+        line += f"{SEP}{aod_name(a.aod_peak)} ~{clock(a.aod_peak_ts, a.now)} ({a.aod_peak:.2f})"
+    return line
+
+
+def set_aod(cfg: Config, a: "Assessment", aod: List[Tuple[int, float]]) -> None:
+    a.aod_now = interp(aod, a.now)
+    ahead = [(v, t) for t, v in aod if a.now < t <= a.now + cfg.watch_hours * HOUR]
+    if ahead:
+        a.aod_peak, a.aod_peak_ts = max(ahead)
 
 
 RING_BEARINGS = [0, 45, 90, 135, 180, 225, 270, 315]
@@ -744,6 +786,9 @@ class Assessment:
     place: str = ""
     blh: Dict[int, float] = field(default_factory=dict)
     learned: Dict[int, Tuple[int, float, float]] = field(default_factory=dict)  # bucket -> (n, bias, rmse)
+    aod_now: Optional[float] = None      # model aerosol optical depth now
+    aod_peak: Optional[float] = None     # highest in the next watch_hours
+    aod_peak_ts: Optional[int] = None
 
     @property
     def max_p(self) -> float:
@@ -1284,15 +1329,17 @@ def decide_smoke(cfg: Config, st: Dict[str, float], sm: Smoke, a: Assessment,
             st["incoming"] = 1
             arrive = f"May arrive: ~{clock(sm.incoming_eta, now)}{SEP}{incoming_layer_text(sm)}"
             mix = mixing_text(sm.incoming_mix)
-        return Message(headline(title, a), _body(current_line(a), smoke_line(sm), arrive, mix, sat, wind),
+        return Message(headline(title, a), _body(current_line(a), smoke_line(sm), aod_line(a), arrive, mix, sat, wind),
                        {1: 2, 2: 3, 3: 3, 4: 3, 5: 4}[sm.level], "fog")
     if sm.level < notified:
         # Only step down after the lower level has held for a while: plumes jitter between analyses.
-        # Clearing to 0 also needs a newer satellite analysis that still shows no smoke.
+        # Clearing to 0 also needs a newer satellite analysis that still shows no smoke, and the
+        # model (which clouds don't hide) showing less than aod_smoke overhead.
         if not st.get("below_since"):
             st.update(below_since=now, below_analysed=sm.analysed or 0)
         elif (now - st["below_since"] >= cfg.smoke_clear_hours * HOUR
-              and (sm.level > 0 or not sm.analysed or sm.analysed > st.get("below_analysed", 0))):
+              and (sm.level > 0 or ((not sm.analysed or sm.analysed > st.get("below_analysed", 0))
+                                    and (a.aod_now is None or a.aod_now < cfg.aod_smoke)))):
             st.update(notified=sm.level, below_since=0, below_analysed=0)
             if sm.level == 0:
                 st["incoming"] = 0
@@ -1300,7 +1347,7 @@ def decide_smoke(cfg: Config, st: Dict[str, float], sm: Smoke, a: Assessment,
                                _body(current_line(a),
                                      f"No satellite smoke plume within {cfg.smoke_far_mi:.0f} mi for {cfg.smoke_clear_hours:g}h"
                                      f"{SEP}clouds can hide smoke from the satellite",
-                                     sat, wind),
+                                     aod_line(a), sat, wind),
                                2, "white_check_mark")
     else:
         st.update(below_since=0, below_analysed=0)
@@ -1311,7 +1358,7 @@ def decide_smoke(cfg: Config, st: Dict[str, float], sm: Smoke, a: Assessment,
             _body(current_line(a),
                   f"From a {sm.incoming_density} plume now ~{sm.incoming_km / MI:.0f} mi {compass(sm.incoming_brg)}"
                   f"{SEP}{incoming_layer_text(sm)}",
-                  smoke_line(sm), mixing_text(sm.incoming_mix), sat, wind),
+                  smoke_line(sm), aod_line(a), mixing_text(sm.incoming_mix), sat, wind),
             3, "fog")
     return None
 
@@ -1321,9 +1368,9 @@ def smoke_status(cfg: Config, a: "Assessment") -> str:
     if not cfg.smoke:
         return ""
     if a.smoke is None:
-        return "Smoke: satellite data unavailable"
+        return _body("Smoke: satellite data unavailable", aod_line(a))
     sat = f"{SEP}🛰️🌎🛰️ {as_of(a.smoke.analysed, a.now)}" if a.smoke.analysed else ""
-    return smoke_line(a.smoke) + sat
+    return _body(smoke_line(a.smoke) + sat, aod_line(a))
 
 
 def incoming_layer_text(sm: Smoke) -> str:
@@ -1623,9 +1670,17 @@ def tick(cfg: Config, store: Store, send: bool = True) -> Assessment:
         except Exception as e:
             log.warning("HMS smoke fetch failed: %s", e)
 
+    aod: List[Tuple[int, float]] = []
+    if cfg.smoke:
+        try:
+            aod = fetch_aod(cfg)
+        except Exception as e:
+            log.warning("model smoke/haze (AOD) fetch failed: %s", e)
+
     learned = store.learned(now - cfg.log_days * 24 * HOUR) if cfg.learn else {}
     a = assess(cfg, model, store.residuals(now - 7 * 24 * HOUR), obs, now, wind_now, surface,
                ring, stations, trajs, origin_model, plumes, trajs_aloft, blh, learned)
+    set_aod(cfg, a, aod)
     peak = a.peak
     log.info("current=%.0f (%s, as of %s) bias=%+.1f sigma0=%.1f max_p=%.0f%% peak=%s %s",
              a.current, a.current_source, as_of(a.current_ts, now) if a.current_ts else "n/a",
@@ -1634,6 +1689,7 @@ def tick(cfg: Config, store: Store, send: bool = True) -> Assessment:
     for t in a.threats[:3]:
         log.info("upwind: %s, eta %s (%.0f%% of scenarios)", threat_text(t), _fmt_time(t.eta), t.support * 100)
     if a.smoke is not None:
+        log.info("%s", aod_line(a) or "model smoke/haze: n/a")
         log.info("smoke: level %d (%s). %s HMS: %d polygons kept, oldest %s, newest %s.",
                  a.smoke.level, SMOKE_NAMES[a.smoke.level], smoke_details(a.smoke), len(plumes or []),
                  _fmt_time(min((p.end for p in plumes or [] if p.end), default=0)) if plumes else "n/a",
@@ -1752,6 +1808,8 @@ def print_status(cfg: Config, a: Assessment) -> None:
                   f"{sm.incoming_km / MI:.0f} mi {compass(sm.incoming_brg)}")
     else:
         print("Smoke: unavailable")
+    if cfg.smoke:
+        print(aod_line(a) or "Smoke/haze (model): unavailable")
     if a.smoke is not None and a.smoke.incoming_eta:
         print(f"  {incoming_layer_text(a.smoke)}; {mixing_text(a.smoke.incoming_mix) or 'mixing height unknown'}")
     print(mixing_text(blh_at(a.blh, a.now)) or "Mixing height: unavailable")

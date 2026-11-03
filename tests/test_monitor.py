@@ -334,6 +334,30 @@ class SmokeTest(unittest.TestCase):
         msg = m.decide_smoke(c, st, self.level([newer]), assessment(), NOW + 13 * H)
         self.assertTrue(msg.title.startswith("Smoke plumes cleared"))
 
+    def test_model_haze_holds_clear(self):
+        """Satellite shows nothing (clouds?) but the model still has smoke overhead: no 'cleared'."""
+        c, st = cfg(), {}
+        m.decide_smoke(c, st, self.level([plume_at(180, 70)]), assessment(), NOW)
+        hazy = assessment()
+        hazy.aod_now = 0.6
+        self.assertIsNone(m.decide_smoke(c, st, self.level([]), hazy, NOW + H))
+        self.assertIsNone(m.decide_smoke(c, st, self.level([]), hazy, NOW + 12 * H))
+        clean = assessment()
+        clean.aod_now = 0.15
+        msg = m.decide_smoke(c, st, self.level([]), clean, NOW + 13 * H)
+        self.assertTrue(msg.title.startswith("Smoke plumes cleared"))
+        self.assertIn("Smoke/haze (model): little, AOD 0.15", msg.body)
+
+    def test_aod_line(self):
+        a = assessment()
+        self.assertEqual(m.aod_line(a), "")
+        m.set_aod(cfg(), a, [(NOW - H, 0.2), (NOW + H, 0.3), (NOW + 5 * H, 0.9), (NOW + 30 * H, 2.0)])
+        self.assertAlmostEqual(a.aod_now, 0.25)
+        self.assertEqual(a.aod_peak, 0.9)  # +30h is past watch_hours
+        self.assertTrue(m.aod_line(a).startswith("Smoke/haze (model): light, AOD 0.25  ||  heavy ~"))
+        a.aod_peak = 0.3
+        self.assertEqual(m.aod_line(a), "Smoke/haze (model): light, AOD 0.25")
+
     def test_aqi_messages_show_smoke(self):
         a = assessment()
         a.smoke = self.level([plume_at(180, 70)])

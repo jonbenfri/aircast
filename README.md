@@ -97,7 +97,7 @@ Each poll (every 15 min by default):
    - ✅ *AQI back to 22* / *Upwind watch over*
    - 🌫️ *Smoke plume within 50 mi (47 mi SW)* / *Smoke plume overhead (light)* /
      *Dense smoke overhead* / *Smoke may arrive ~19:00*: sent when the level rises.
-     Drops are silent until they've held for 6 h; *Smoke plumes cleared* when back to 0 and a newer satellite analysis agrees (clouds can hide smoke). Every AQI alert also carries the smoke line.
+     Drops are silent until they've held for 6 h; *Smoke plumes cleared* when back to 0 and a newer satellite analysis agrees (clouds can hide smoke). Every AQI alert also carries the smoke line. A second line gives the CAMS model's smoke/haze overhead (aerosol optical depth via Open-Meteo: little <0.2, light, moderate ≥0.4, heavy ≥0.8), which clouds don't hide; *cleared* also waits until it's below 0.4.
    - ❌ *monitor can't get data*, sent after 6 failed polls in a row (~3 h)
 10. **Polling:** every 60 min when everything is clear, every 30 min when anything
     is brewing (any alert level, P ≥ 20%, AQI within 5 of the threshold, or any smoke).
