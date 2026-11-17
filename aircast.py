@@ -125,6 +125,12 @@ class Config:
     smoke_far_mi: float = 200.0
     aod_smoke: float = 0.4
     dilution_km: float = 400.0
+    inversion: bool = True            # temperature inversion forecast, alerts and model tweaks
+    inversion_min_c: float = 0.5      # warmer aloft than at 2 m by this much = inversion
+    inversion_alert_c: float = 2.0    # alert for inversions at least this strong ...
+    inversion_alert_hours: float = 3  # ... lasting at least this long
+    inversion_wind_ms: float = 3.0    # trapping needs wind below this (or shallow mixing)
+    inversion_tau: float = 2.0        # local readings persist this many times longer while trapped
     learn: bool = True
     learn_shrink: float = 50.0
     log_days: int = 60
@@ -175,6 +181,12 @@ class Config:
             smoke_far_mi=f("AQI_SMOKE_FAR_MI", 200),
             aod_smoke=f("AQI_AOD_SMOKE", 0.4),
             dilution_km=f("AQI_DILUTION_KM", 400),
+            inversion=_env("AQI_INVERSION", "1") not in ("0", "false", "no"),
+            inversion_min_c=f("AQI_INVERSION_MIN_C", 0.5),
+            inversion_alert_c=f("AQI_INVERSION_ALERT_C", 2.0),
+            inversion_alert_hours=f("AQI_INVERSION_ALERT_HOURS", 3),
+            inversion_wind_ms=f("AQI_INVERSION_WIND_MS", 3.0),
+            inversion_tau=f("AQI_INVERSION_TAU", 2.0),
             learn=_env("AQI_LEARN", "1") not in ("0", "false", "no"),
             learn_shrink=f("AQI_LEARN_SHRINK", 50),
             log_days=int(f("AQI_LOG_DAYS", 60)),
@@ -310,6 +322,38 @@ class WindData:
     transport: Dict[int, Wind]  # mean of 10 m and 850 hPa (~5,000 ft): carries air near the ground
     aloft: Dict[int, Wind]      # 700 hPa (~10,000 ft): carries smoke plumes
     blh: Dict[int, float]       # boundary layer (mixing) height in metres
+    inv: Dict[int, "Inversion"] = field(default_factory=dict)  # temperature inversion by hour
+
+
+@dataclass
+class Inversion:
+    strength: float  # deg C warmer aloft than at 2 m (max over the lowest ~1500 m)
+    height: float    # m above ground of that warmest level
+
+
+# Heights above ground for the fixed-height levels; pressure levels use their geopotential height.
+PROFILE_FIXED = {"temperature_80m": 80.0, "temperature_120m": 120.0, "temperature_180m": 180.0}
+PROFILE_LEVELS = [975, 950, 925, 900, 850]
+
+
+def parse_profile(h: dict, elevation: float, min_c: float) -> Dict[int, Inversion]:
+    """Hourly inversions from a temperature profile: any level up to 1500 m above ground that is
+    at least min_c warmer than the 2 m temperature. (Normally air cools ~6.5 C per km of height.)"""
+    out: Dict[int, Inversion] = {}
+    t2 = h.get("temperature_2m") or []
+    for i, t in enumerate(h.get("time", [])):
+        if i >= len(t2) or t2[i] is None:
+            continue
+        levels = [(agl, (h.get(v) or [None] * (i + 1))[i]) for v, agl in PROFILE_FIXED.items()]
+        for p in PROFILE_LEVELS:
+            gh = (h.get(f"geopotential_height_{p}hPa") or [None] * (i + 1))[i]
+            if gh is not None:
+                levels.append((gh - elevation, (h.get(f"temperature_{p}hPa") or [None] * (i + 1))[i]))
+        best = max(((tl - t2[i], agl) for agl, tl in levels if tl is not None and 20 < agl <= 1500),
+                   key=lambda x: (x[0], -x[1]), default=None)  # warmest; lowest such level on ties
+        if best and best[0] >= min_c:
+            out[int(t)] = Inversion(best[0], best[1])
+    return out
 
 
 def fetch_wind(cfg: Config) -> WindData:
@@ -349,7 +393,87 @@ def fetch_wind(cfg: Config) -> WindData:
         blh = {int(t): float(v) for t, v in zip(b["time"], b.get("boundary_layer_height", [])) if v is not None}
     except Exception as e:
         log.warning("mixing height unavailable: %s", e)
-    return WindData(cur, surface, transport, w700 or transport, blh)
+
+    inv: Dict[int, Inversion] = {}
+    if cfg.inversion:
+        try:  # temperature profile: inversions (warm air sitting on cold air near the ground)
+            levels = [f"{v}_{p}hPa" for p in PROFILE_LEVELS for v in ("temperature", "geopotential_height")]
+            try:
+                d = _get_json(OPEN_METEO_WEATHER_URL,
+                              dict(params, hourly=",".join(["temperature_2m"] + list(PROFILE_FIXED) + levels)))
+            except urllib.error.HTTPError:  # fixed heights missing for this model: pressure levels only
+                d = _get_json(OPEN_METEO_WEATHER_URL, dict(params, hourly=",".join(["temperature_2m"] + levels)))
+            inv = parse_profile(d["hourly"], float(d.get("elevation") or 0.0), cfg.inversion_min_c)
+        except Exception as e:
+            log.warning("temperature profile unavailable: %s", e)
+    return WindData(cur, surface, transport, w700 or transport, blh, inv)
+
+
+def trapping(cfg: Config, inv: Optional[Inversion], wind: Optional["Wind"], mix: Optional[float]) -> bool:
+    """An inversion with light wind or shallow mixing: local pollution builds up near the ground."""
+    return inv is not None and ((wind is None or wind.speed < cfg.inversion_wind_ms)
+                                or (mix is not None and mix < 300))
+
+
+def inversion_name(c: float) -> str:
+    return "strong" if c >= 5 else "moderate" if c >= 2 else "weak"
+
+
+@dataclass
+class InversionEvent:
+    start: int
+    end: int          # last trapped hour
+    strength: float   # strongest, deg C
+    height: float     # m above ground at the strongest hour
+    peak_aqi: Optional[float] = None
+    peak_ts: Optional[int] = None
+
+
+def inversion_runs(cfg: Config, a: "Assessment") -> List[InversionEvent]:
+    """Runs of consecutive trapped hours from now through watch_hours."""
+    runs: List[InversionEvent] = []
+    for t in sorted(t for t in a.inv if t > a.now - HOUR and t <= a.now + cfg.watch_hours * HOUR):
+        w = a.wind_now if t <= a.now + HOUR and a.wind_now else a.surface.get(t)
+        if not trapping(cfg, a.inv[t], w, blh_at(a.blh, t)):
+            continue
+        iv = a.inv[t]
+        if runs and t - runs[-1].end <= HOUR:
+            ev = runs[-1]
+            ev.end = t
+            if iv.strength > ev.strength:
+                ev.strength, ev.height = iv.strength, iv.height
+        else:
+            runs.append(InversionEvent(t, t, iv.strength, iv.height))
+    return runs
+
+
+def inversion_event(cfg: Config, a: "Assessment", within_h: float) -> Optional[InversionEvent]:
+    """First inversion worth knowing about (at least inversion_alert_c, lasting at least
+    inversion_alert_hours) that is under way or starts within `within_h` hours."""
+    for ev in inversion_runs(cfg, a):
+        if ev.start > a.now + within_h * HOUR:
+            break
+        if ev.strength >= cfg.inversion_alert_c and (ev.end - ev.start) / HOUR + 1 >= cfg.inversion_alert_hours:
+            during = [h for h in a.hours if ev.start <= h.ts <= ev.end]
+            if during:
+                pk = max(during, key=lambda h: h.corrected)
+                ev.peak_aqi, ev.peak_ts = pk.corrected, pk.ts
+            return ev
+    return None
+
+
+def inversion_line(cfg: Config, a: "Assessment", within_h: Optional[float] = None) -> str:
+    """e.g. 'Inversion: 9 PM–Wed 8 AM  ||  moderate, +6°F at ~400 ft  ||  traps local pollution near the ground'."""
+    if not cfg.inversion:
+        return ""
+    ev = inversion_event(cfg, a, cfg.horizon_hours if within_h is None else within_h)
+    if ev is None:
+        return ""
+    when = (f"now until ~{clock(ev.end + HOUR, a.now)}" if ev.start <= a.now
+            else f"~{clock(ev.start, a.now)}–{clock(ev.end + HOUR, ev.start)}")
+    ft = round(ev.height * 3.281 / 100) * 100
+    return (f"Inversion: {when}{SEP}{inversion_name(ev.strength)}, +{ev.strength * 1.8:.0f}°F at ~{ft:,} ft"
+            f"{SEP}traps local pollution near the ground")
 
 
 def blh_at(blh: Dict[int, float], ts: float) -> Optional[float]:
@@ -766,6 +890,7 @@ class HourForecast:
     traj: Optional[Trajectory] = None
     base: Optional[float] = None    # forecast before the learned correction (what gets learned from)
     blh: Optional[float] = None     # mixing height, m
+    inv: Optional[float] = None     # inversion strength, deg C, while it traps pollution
 
 
 @dataclass
@@ -786,6 +911,7 @@ class Assessment:
     place: str = ""
     blh: Dict[int, float] = field(default_factory=dict)
     learned: Dict[int, Tuple[int, float, float]] = field(default_factory=dict)  # bucket -> (n, bias, rmse)
+    inv: Dict[int, "Inversion"] = field(default_factory=dict)
     aod_now: Optional[float] = None      # model aerosol optical depth now
     aod_peak: Optional[float] = None     # highest in the next watch_hours
     aod_peak_ts: Optional[int] = None
@@ -812,7 +938,8 @@ def assess(cfg: Config, model: List[Tuple[int, float]], residuals: List[Tuple[in
            plumes: Optional[List["Plume"]] = None,
            trajs_aloft: Optional[List[Trajectory]] = None,
            blh: Optional[Dict[int, float]] = None,
-           learned: Optional[Dict[int, Tuple[int, float, float]]] = None) -> Assessment:
+           learned: Optional[Dict[int, Tuple[int, float, float]]] = None,
+           inv: Optional[Dict[int, "Inversion"]] = None) -> Assessment:
     """wind_hourly is the 10 m wind; trajs default to tracing it if not given."""
     bias = estimate_bias(residuals, now)
     sigma0 = estimate_sigma0(residuals, cfg.sigma0)
@@ -831,7 +958,7 @@ def assess(cfg: Config, model: List[Tuple[int, float]], residuals: List[Tuple[in
                    sigma0=sigma0, wind_now=wind_now, surface=wind_hourly or {}, trajs=trajs,
                    current_ts=current_ts,
                    place=cfg.place or (observation[2].split(",")[0] if observation else ""),
-                   blh=blh or {}, learned=learned or {})
+                   blh=blh or {}, learned=learned or {}, inv=inv or {})
     a.threats = find_threats(cfg, stations or [], [t for t in trajs if t.lead_h <= cfg.watch_hours],
                              origin_model, current)
     if plumes is not None:
@@ -851,11 +978,17 @@ def assess(cfg: Config, model: List[Tuple[int, float]], residuals: List[Tuple[in
         if ts <= now or ts > end:
             continue
         lead = (ts - now) / HOUR
-        corrected = max(0.0, m + bias * math.exp(-lead / cfg.tau_hours))
-        sigma = math.hypot(sigma0, cfg.sigma_growth * lead)
-
         # Use the current wind for the first hour, forecast wind after that.
         w = wind_now if (lead <= 1 and wind_now) else (wind_hourly or {}).get(ts)
+        mix = blh_at(a.blh, ts)
+        iv = a.inv.get(ts)
+        trapped = cfg.inversion and trapping(cfg, iv, w, mix)
+        # Under an inversion the air near the ground barely mixes or moves, so today's local
+        # departure from the model (wood smoke, traffic) lasts longer.
+        tau = cfg.tau_hours * (cfg.inversion_tau if trapped else 1.0)
+        corrected = max(0.0, m + bias * math.exp(-lead / tau))
+        sigma = math.hypot(sigma0, cfg.sigma_growth * lead)
+
         up = None
         if w is not None:
             if ring:
@@ -863,7 +996,7 @@ def assess(cfg: Config, model: List[Tuple[int, float]], residuals: List[Tuple[in
                 if adv is not None:
                     up = adv[0]
                     # Bias-correct the upwind value too: same model, same region.
-                    up_c = max(0.0, up + bias * math.exp(-lead / cfg.tau_hours))
+                    up_c = max(0.0, up + bias * math.exp(-lead / tau))
                     gap = up_c - corrected
                     corrected += wind_weight(w.speed, cfg.wind_weight) * gap
                     sigma = math.hypot(sigma, 0.5 * gap)
@@ -886,25 +1019,32 @@ def assess(cfg: Config, model: List[Tuple[int, float]], residuals: List[Tuple[in
                     sigma = math.hypot(sigma, spread, 0.5 * (1 - conf) * abs(gap))
             if w.speed < cfg.stagnant_ms:
                 sigma = math.hypot(sigma, cfg.stagnant_sigma * (1 - w.speed / cfg.stagnant_ms))
-        mix = blh_at(a.blh, ts)
         if mix is not None and mix < 300 and (w is None or w.speed < cfg.stagnant_ms):
-            # Inversion: shallow mixing + light wind traps local pollution near the ground.
+            # Shallow mixing + light wind traps local pollution near the ground.
             sigma = math.hypot(sigma, cfg.stagnant_sigma * (1 - mix / 300))
+        if trapped:
+            sigma = math.hypot(sigma, cfg.stagnant_sigma * min(1.0, iv.strength / 5))
 
         # Learned correction: the average error of past forecasts at this lead time, shrunk toward
         # zero while there's little data (n / (n + learn_shrink)).
         base = corrected
         n, lb, _ = a.learned.get(lead_bucket(lead), (0, 0.0, 0.0))
-        if cfg.learn and n:
-            corrected = max(0.0, corrected + n / (n + cfg.learn_shrink) * lb)
+        adj = n / (n + cfg.learn_shrink) * lb if n else 0.0
+        ni, ib, _ = a.learned.get(INVERSION_KEY, (0, 0.0, 0.0))
+        if trapped and ni:  # inversion hours have their own learned error, once there's data
+            wi = ni / (ni + cfg.learn_shrink)
+            adj = wi * ib + (1 - wi) * adj
+        if cfg.learn and adj:
+            corrected = max(0.0, corrected + adj)
 
         a.hours.append(HourForecast(ts, lead, m, corrected, sigma,
                                     prob_exceed(corrected, sigma, cfg.threshold), w, up, by_ts.get(ts),
-                                    base, mix))
+                                    base, mix, iv.strength if trapped else None))
     return a
 
 
 LEAD_BUCKETS = [(0, 3), (3, 6), (6, 12), (12, 24), (24, 72)]
+INVERSION_KEY = -1  # learned-table key for hours forecast to be under a trapping inversion
 
 
 def lead_bucket(lead_h: float) -> int:
@@ -1373,6 +1513,38 @@ def smoke_status(cfg: Config, a: "Assessment") -> str:
     return _body(smoke_line(a.smoke) + sat, aod_line(a))
 
 
+def decide_inversion(cfg: Config, st: Dict[str, float], a: "Assessment") -> Optional["Message"]:
+    """One notice per inversion that traps pollution: strong enough, long enough, under way or
+    starting within horizon_hours. st holds until (end of the inversion last alerted)."""
+    if not cfg.inversion:
+        return None
+    ev = inversion_event(cfg, a, cfg.horizon_hours)
+    if ev is None:
+        return None
+    if st.get("until", 0) >= ev.start - 2 * HOUR:  # the one already alerted, still going
+        st["until"] = max(st["until"], ev.end)
+        return None
+    st["until"] = ev.end
+    title = (f"Temperature inversion now, until ~{clock(ev.end + HOUR, a.now)}" if ev.start <= a.now
+             else f"Temperature inversion ~{clock(ev.start, a.now)}–{clock(ev.end + HOUR, ev.start)}")
+    ft = round(ev.height * 3.281 / 100) * 100
+    detail = [f"{inversion_name(ev.strength).capitalize()}: +{ev.strength * 1.8:.0f}°F warmer at ~{ft:,} ft than at the ground"]
+    winds = [w.speed for t, w in a.surface.items() if ev.start <= t <= ev.end]
+    if winds:
+        detail.append(f"wind ~{sum(winds) / len(winds) * MPH:.0f} mph")
+    mixes = [m for m in (blh_at(a.blh, t) for t in range(ev.start, ev.end + 1, HOUR)) if m is not None]
+    if mixes:
+        detail.append(f"mixing ~{round(min(mixes) * 3.281 / 100) * 100:,} ft")
+    peak = (f"AQI during it: peak ~{ev.peak_aqi:.0f} around {clock(ev.peak_ts, a.now)}"
+            if ev.peak_aqi is not None else "")
+    worry = ev.peak_aqi is not None and ev.peak_aqi >= 0.75 * cfg.threshold
+    return Message(headline(title, a),
+                   _body(current_line(a), SEP.join(detail),
+                         "Traps local pollution (wood smoke, traffic) near the ground until it breaks",
+                         peak, smoke_status(cfg, a), wind_outlook(a)),
+                   3 if worry else 2, "thermometer")
+
+
 def incoming_layer_text(sm: Smoke) -> str:
     return "on winds aloft (~10,000 ft)" if sm.incoming_layer == "aloft" else "on near-ground winds"
 
@@ -1494,7 +1666,8 @@ def decide(cfg: Config, prev: str, last_notified: float, a: Assessment) -> Tuple
     level = next_level(cfg, prev, a)
     thr, hz = int(cfg.threshold), cfg.horizon_hours
     peak = a.peak
-    wind = _body(smoke_status(cfg, a), wind_outlook(a))
+    inv = inversion_line(cfg, a)
+    wind = _body(inv, smoke_status(cfg, a), wind_outlook(a))
 
     if level == NOW and (prev != NOW or (cfg.remind_hours > 0 and a.now - last_notified >= cfg.remind_hours * HOUR)):
         return level, Message(
@@ -1511,7 +1684,7 @@ def decide(cfg: Config, prev: str, last_notified: float, a: Assessment) -> Tuple
             _body(current_line(a),
                   f"Chance above {thr} in next {hz}h: {a.max_p:.0%}",
                   f"Peak: ~{peak.corrected:.0f} around {clock(peak.ts, a.now)}" if peak else "",
-                  mixing_text(peak.blh) if peak and peak.blh is not None and peak.blh < 300 else "",
+                  mixing_text(peak.blh) if not inv and peak and peak.blh is not None and peak.blh < 300 else "",
                   wind),
             3, "warning")
     if level == WATCH and RANK[prev] < RANK[WATCH]:
@@ -1553,6 +1726,10 @@ class Store:
                 issued INTEGER, valid INTEGER, lead REAL, model REAL, base REAL,
                 corrected REAL, sigma REAL, p REAL, PRIMARY KEY (issued, valid));
         """)
+        cols = [r[1] for r in self.db.execute("PRAGMA table_info(forecast)")]
+        if "inv" not in cols:  # added later: 1 = forecast under a trapping inversion
+            self.db.execute("ALTER TABLE forecast ADD COLUMN inv INTEGER DEFAULT 0")
+            self.db.commit()
 
     def add_residual(self, ts: int, observed: float, model: float) -> None:
         self.db.execute("INSERT OR REPLACE INTO residual VALUES (?,?,?)", (ts, observed, model))
@@ -1565,9 +1742,10 @@ class Store:
 
     def log_forecast(self, a: Assessment, keep_days: int) -> None:
         self.db.executemany(
-            "INSERT OR REPLACE INTO forecast VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO forecast (issued, valid, lead, model, base, corrected, sigma, p, inv) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             [(a.now, h.ts, h.lead_h, h.model, h.base if h.base is not None else h.corrected,
-              h.corrected, h.sigma, h.p_exceed) for h in a.hours])
+              h.corrected, h.sigma, h.p_exceed, int(h.inv is not None)) for h in a.hours])
         self.db.execute("DELETE FROM forecast WHERE issued < ?", (a.now - keep_days * 24 * HOUR,))
         self.db.commit()
 
@@ -1578,10 +1756,14 @@ class Store:
             "JOIN residual r ON r.ts = f.valid WHERE f.issued >= ?", (since,)))
 
     def learned(self, since: float) -> Dict[int, Tuple[int, float, float]]:
-        """Per lead bucket: (n, mean error observed - base, RMSE)."""
+        """Per lead bucket, plus INVERSION_KEY for inversion hours: (n, mean error observed - base, RMSE)."""
         acc: Dict[int, List[float]] = {}
-        for lead, base, _, _, _, obs in self.pairs(since):
+        for lead, base, obs, inv in self.db.execute(
+                "SELECT f.lead, f.base, r.observed, f.inv FROM forecast f "
+                "JOIN residual r ON r.ts = f.valid WHERE f.issued >= ?", (since,)):
             acc.setdefault(lead_bucket(lead), []).append(obs - base)
+            if inv:
+                acc.setdefault(INVERSION_KEY, []).append(obs - base)
         return {b: (len(e), sum(e) / len(e), math.sqrt(sum(x * x for x in e) / len(e))) for b, e in acc.items()}
 
     def get(self, k: str, default: str) -> str:
@@ -1644,10 +1826,11 @@ def tick(cfg: Config, store: Store, send: bool = True) -> Assessment:
     trajs: List[Trajectory] = []
     trajs_aloft: List[Trajectory] = []
     blh: Dict[int, float] = {}
+    inv: Dict[int, Inversion] = {}
     if cfg.use_wind:
         try:  # Wind refines the forecast; never let it block alerts.
             wd = fetch_wind(cfg)
-            wind_now, surface, blh = wd.current, wd.surface, wd.blh
+            wind_now, surface, blh, inv = wd.current, wd.surface, wd.blh, wd.inv
             trajs = back_trajectories(cfg, now, wd.transport, max(cfg.watch_hours, cfg.horizon_hours))
             trajs_aloft = back_trajectories(cfg, now, wd.aloft, cfg.watch_hours)
             ring = fetch_ring(cfg, cfg.ring_km)
@@ -1679,7 +1862,7 @@ def tick(cfg: Config, store: Store, send: bool = True) -> Assessment:
 
     learned = store.learned(now - cfg.log_days * 24 * HOUR) if cfg.learn else {}
     a = assess(cfg, model, store.residuals(now - 7 * 24 * HOUR), obs, now, wind_now, surface,
-               ring, stations, trajs, origin_model, plumes, trajs_aloft, blh, learned)
+               ring, stations, trajs, origin_model, plumes, trajs_aloft, blh, learned, inv)
     set_aod(cfg, a, aod)
     peak = a.peak
     log.info("current=%.0f (%s, as of %s) bias=%+.1f sigma0=%.1f max_p=%.0f%% peak=%s %s",
@@ -1690,6 +1873,9 @@ def tick(cfg: Config, store: Store, send: bool = True) -> Assessment:
         log.info("upwind: %s, eta %s (%.0f%% of scenarios)", threat_text(t), _fmt_time(t.eta), t.support * 100)
     if a.smoke is not None:
         log.info("%s", aod_line(a) or "model smoke/haze: n/a")
+    if cfg.inversion:
+        log.info("%s", inversion_line(cfg, a, cfg.watch_hours) or "inversion: none trapping in the next %dh"
+                 % cfg.watch_hours)
         log.info("smoke: level %d (%s). %s HMS: %d polygons kept, oldest %s, newest %s.",
                  a.smoke.level, SMOKE_NAMES[a.smoke.level], smoke_details(a.smoke), len(plumes or []),
                  _fmt_time(min((p.end for p in plumes or [] if p.end), default=0)) if plumes else "n/a",
@@ -1709,6 +1895,13 @@ def tick(cfg: Config, store: Store, send: bool = True) -> Assessment:
         for k, v in st.items():
             store.set("smoke_" + k, v)
 
+    if cfg.inversion:
+        st = {"until": float(store.get("inversion_until", "0"))}
+        imsg = decide_inversion(cfg, st, a)
+        if imsg:
+            notify(cfg, imsg)
+        store.set("inversion_until", st["until"])
+
     prev = store.get("level", CLEAR)
     last = float(store.get("last_notified", "0"))
     level, msg = decide(cfg, prev, last, a)
@@ -1727,6 +1920,9 @@ def learned_text(cfg: Config, learned: Dict[int, Tuple[int, float, float]]) -> s
         if b in learned:
             n, bias, _ = learned[b]
             out.append(f"{lo}-{hi}h {n / (n + cfg.learn_shrink) * bias:+.1f} (n={n})")
+    if INVERSION_KEY in learned:
+        n, bias, _ = learned[INVERSION_KEY]
+        out.append(f"inversion hours {bias:+.1f} (n={n}, weight {n / (n + cfg.learn_shrink):.0%})")
     return ", ".join(out)
 
 
@@ -1813,11 +2009,15 @@ def print_status(cfg: Config, a: Assessment) -> None:
     if a.smoke is not None and a.smoke.incoming_eta:
         print(f"  {incoming_layer_text(a.smoke)}; {mixing_text(a.smoke.incoming_mix) or 'mixing height unknown'}")
     print(mixing_text(blh_at(a.blh, a.now)) or "Mixing height: unavailable")
+    if cfg.inversion:
+        print(inversion_line(cfg, a, cfg.watch_hours)
+              or ("Inversion: none trapping pollution in the next %dh" % cfg.watch_hours if a.inv or a.blh
+                  else "Inversion: temperature profile unavailable"))
     if a.learned:
         print(f"Learned corrections: {learned_text(cfg, a.learned)}")
     print(f"Threshold {cfg.threshold:.0f}; max chance of exceeding in next {cfg.horizon_hours}h: {a.max_p:.0%}\n")
     print(f"{'time':>10} {'lead':>5} {'wind mph':>9} {'air from':>12} {'upwind':>6} {'mix ft':>7} "
-          f"{'model':>6} {'corr':>6} {'+/-':>5} {'P>thr':>6}")
+          f"{'inv °F':>6} {'model':>6} {'corr':>6} {'+/-':>5} {'P>thr':>6}")
     for h in a.hours:
         wind = f"{compass(h.wind.direction)} {h.wind.speed * MPH:.0f}" if h.wind else "-"
         src = "-"
@@ -1826,8 +2026,9 @@ def print_status(cfg: Config, a: Assessment) -> None:
             src = f"{km / MI:.0f} mi {compass(brg)}"
         up = f"{h.upwind:.0f}" if h.upwind is not None else "-"
         mix = f"{h.blh * 3.281:,.0f}" if h.blh is not None else "-"
+        iv = f"+{h.inv * 1.8:.0f}" if h.inv is not None else "-"
         bar = "#" * int(h.p_exceed * 20)
-        print(f"{_fmt_time(h.ts):>10} {h.lead_h:4.0f}h {wind:>9} {src:>12} {up:>6} {mix:>7} {h.model:6.0f} "
+        print(f"{_fmt_time(h.ts):>10} {h.lead_h:4.0f}h {wind:>9} {src:>12} {up:>6} {mix:>7} {iv:>6} {h.model:6.0f} "
               f"{h.corrected:6.0f} {h.sigma:5.1f} {h.p_exceed:6.0%} {bar}")
 
 

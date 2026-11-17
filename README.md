@@ -37,6 +37,14 @@ Each poll (every 15 min by default):
    whether smoke aloft can reach the ground (deep mixing on sunny afternoons) or
    stays up (shallow at night). Shallow mixing plus light wind is treated as an
    inversion that traps local pollution, which widens the uncertainty.
+   **Temperature inversions** come from the forecast temperature profile
+   (2 m, 80/120/180 m and the 975–850 hPa levels): any level up to 1,500 m above
+   ground that is warmer than the 2 m air is an inversion, and its strength is that
+   difference (weak < 2 °C, moderate 2–5, strong ≥ 5). It traps pollution when the
+   wind is under 3 m/s (~7 mph) or mixing is under 300 m. In trapped hours the
+   current local departure from the model lasts twice as long (wood smoke and
+   traffic don't get carried off), the uncertainty widens with the strength, and
+   inversion hours get their own learned error once there's data.
 6b. **Learned correction:** every forecast hour is logged and later matched
    with what AirNow measured. The average error at each lead time (0–3, 3–6,
    6–12, 12–24 h) is added back, shrunk toward zero while data is scarce:
@@ -98,6 +106,12 @@ Each poll (every 15 min by default):
    - 🌫️ *Smoke plume within 50 mi (47 mi SW)* / *Smoke plume overhead (light)* /
      *Dense smoke overhead* / *Smoke may arrive ~19:00*: sent when the level rises.
      Drops are silent until they've held for 6 h; *Smoke plumes cleared* when back to 0 and a newer satellite analysis agrees (clouds can hide smoke). Every AQI alert also carries the smoke line. A second line gives the CAMS model's smoke/haze overhead (aerosol optical depth via Open-Meteo: little <0.2, light, moderate ≥0.4, heavy ≥0.8), which clouds don't hide; *cleared* also waits until it's below 0.4.
+   - 🌡️ *Temperature inversion ~9 PM–8 AM* / *Temperature inversion now, until ~10 AM*:
+     once per inversion that traps pollution, is at least moderate (+2 °C / ~4 °F) and lasts
+     3 h or more, sent when it's under way or starts within 12 h. Shows strength and height,
+     wind, mixing and the forecast AQI peak during it; normal priority if that peak is near the
+     threshold, low otherwise. Watch/forecast/AQI alerts carry an `Inversion:` line when one is
+     coming within 12 h.
    - ❌ *monitor can't get data*, sent after 6 failed polls in a row (~3 h)
 10. **Polling:** every 60 min when everything is clear, every 30 min when anything
     is brewing (any alert level, P ≥ 20%, AQI within 5 of the threshold, or any smoke).

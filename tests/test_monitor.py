@@ -491,7 +491,7 @@ class LearningTest(unittest.TestCase):
         for k in range(100):
             issued = NOW - (200 - k) * H
             valid = issued + 2 * H
-            store.db.execute("INSERT INTO forecast VALUES (?,?,?,?,?,?,?,?)",
+            store.db.execute("INSERT INTO forecast (issued, valid, lead, model, base, corrected, sigma, p) VALUES (?,?,?,?,?,?,?,?)",
                              (issued, valid, 2.0, 20, 20, 20, 8, 0.05))
             store.add_residual(valid, 30.0, 20.0)
         learned = store.learned(NOW - 30 * 24 * H)
@@ -505,7 +505,7 @@ class LearningTest(unittest.TestCase):
     def test_score_runs(self):
         import contextlib, io as _io
         store = m.Store(":memory:")
-        store.db.execute("INSERT INTO forecast VALUES (?,?,?,?,?,?,?,?)",
+        store.db.execute("INSERT INTO forecast (issued, valid, lead, model, base, corrected, sigma, p) VALUES (?,?,?,?,?,?,?,?)",
                          (NOW - 5 * H, NOW - 3 * H, 2.0, 20, 20, 40, 8, 0.7))
         store.add_residual(NOW - 3 * H, 45.0, 20.0)
         out = _io.StringIO()
@@ -553,3 +553,80 @@ class PlumeDirectionTest(unittest.TestCase):
         d = m.assess_smoke(cfg(), [wide], []).band_dirs[1][0]
         self.assertIn("SW", d.split("/"))
         self.assertGreaterEqual(len(d.split("/")), 2)
+
+
+class InversionTest(unittest.TestCase):
+    BASE = NOW // H * H
+
+    def inv(self, strength, hours, height=120.0):
+        return {self.BASE + h * H: m.Inversion(strength, height) for h in hours}
+
+    def test_parse_profile(self):
+        h = {"time": [0, 3600, 7200],
+             "temperature_2m": [0.0, 10.0, 0.0],
+             "temperature_80m": [2.0, 9.5, None],
+             "temperature_975hPa": [1.0, 7.0, 0.5],
+             "geopotential_height_975hPa": [450.0, 450.0, 160.0]}  # elevation 150 m
+        p = m.parse_profile(h, 150.0, 0.5)
+        self.assertEqual(p[0].strength, 2.0)
+        self.assertEqual(p[0].height, 80.0)
+        self.assertNotIn(3600, p)  # normal: colder aloft
+        self.assertNotIn(7200, p)  # 975 hPa only 10 m above ground: ignored
+
+    def test_trapping_needs_light_wind_or_shallow_mixing(self):
+        c, iv = cfg(), m.Inversion(3, 100)
+        self.assertTrue(m.trapping(c, iv, m.Wind(1, 0), 800))
+        self.assertFalse(m.trapping(c, iv, m.Wind(6, 0), 800))
+        self.assertTrue(m.trapping(c, iv, m.Wind(6, 0), 200))
+        self.assertFalse(m.trapping(c, None, m.Wind(1, 0), 200))
+
+    def assessment(self, inv, speed=1.0):
+        a = m.assess(cfg(), flat(20), [], None, NOW, None, winds(speed, 180), inv=inv)
+        a.place = "Testville, KS"
+        return a
+
+    def test_event_and_line(self):
+        a = self.assessment(self.inv(3.0, range(3, 11)))
+        ev = m.inversion_event(cfg(), a, 12)
+        self.assertEqual((ev.start - NOW) // H, 2)  # +3h from the hour = 2h50m from now
+        self.assertEqual((ev.end - ev.start) // H, 7)
+        line = m.inversion_line(cfg(), a)
+        self.assertIn("moderate, +5°F at ~400 ft", line)
+        self.assertIn("traps local pollution", line)
+        self.assertEqual(m.inversion_line(cfg(), self.assessment(self.inv(3.0, range(3, 11)), speed=6)), "")
+
+    def test_alert_once_per_inversion(self):
+        c, st = cfg(), {}
+        a = self.assessment(self.inv(3.0, range(0, 10)))
+        msg = m.decide_inversion(c, st, a)
+        self.assertTrue(msg.title.startswith("Temperature inversion now, until ~"))
+        self.assertIn("+5°F warmer at ~400 ft", msg.body)
+        self.assertIsNone(m.decide_inversion(c, st, a))  # same inversion: quiet
+        later = self.assessment({**self.inv(3.0, range(0, 10)), **self.inv(4.0, range(20, 30))})
+        later.now += 12 * H  # the first one is over; the next starts in ~8h
+        self.assertIsNotNone(m.decide_inversion(c, st, later))
+
+    def test_no_alert_for_weak_or_short(self):
+        self.assertIsNone(m.decide_inversion(cfg(), {}, self.assessment(self.inv(1.0, range(0, 10)))))
+        self.assertIsNone(m.decide_inversion(cfg(), {}, self.assessment(self.inv(4.0, range(1, 3)))))
+
+    def test_trapped_readings_persist(self):
+        res = [(NOW - k * H, 15.0) for k in range(6)]  # monitors read 15 above the model
+        args = (cfg(), flat(20), res, (NOW, 35.0, "x"), NOW, None, winds(1, 180))
+        plain = m.assess(*args)
+        trapped = m.assess(*args, inv=self.inv(3.0, range(0, 13)))
+        p, t = plain.hours[9], trapped.hours[9]
+        self.assertGreater(t.corrected, p.corrected + 2)
+        self.assertGreater(t.sigma, p.sigma)
+        self.assertEqual(t.inv, 3.0)
+
+    def test_learned_inversion_bias(self):
+        store = m.Store(":memory:")
+        for k in range(100):
+            issued, valid = NOW - (k + 3) * H, NOW - (k + 1) * H
+            store.db.execute("INSERT INTO forecast VALUES (?,?,?,?,?,?,?,?,?)",
+                             (issued, valid, 2.0, 20, 20, 20, 8, 0.05, 1))
+            store.add_residual(valid, 30.0, 20.0)
+        learned = store.learned(0)
+        self.assertEqual(learned[m.INVERSION_KEY][:2], (100, 10.0))
+        self.assertIn("inversion hours +10.0", m.learned_text(cfg(), learned))
