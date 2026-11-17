@@ -3,7 +3,7 @@
 Ideas and open items, roughly in priority order.
 
 ## Before open-sourcing
-- Choose a license (MIT, Apache-2.0 or GPL-3.0) and add `LICENSE`.
+- ~~Choose a license~~ (done: MIT, with an educational/research-use notice).
 - GitHub Action that runs `uv run python -m unittest` on every push.
 - Short CONTRIBUTING note.
 

@@ -3,5 +3,7 @@ name = "aircast"
 version = "0.1.0"
 description = "Air quality forecasting: AQI threshold alerts using wind trajectories, upwind monitors and satellite smoke, pushed via ntfy"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = []

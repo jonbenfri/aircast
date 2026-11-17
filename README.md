@@ -8,6 +8,13 @@ Forecasts when the US AQI near you will go above a threshold (default **35**)
 and sends a push notification to your phone through your own
 [ntfy](https://ntfy.sh) server. It uses only the Python standard library.
 
+> **Educational and research use only.** aircast is an experimental forecasting
+> project. Its forecasts and alerts are estimates from models and preliminary data,
+> and they can be late, wrong or missing. It is not a medical device, not an official
+> air quality forecast or advisory, and not a substitute for guidance from your
+> local air quality agency, [AirNow](https://www.airnow.gov), the National Weather
+> Service or a health professional. Don't rely on it for health or safety decisions.
+
 ## How it estimates
 
 Each poll (every 15 min by default):
@@ -308,3 +315,9 @@ AirNow's guidelines matter if this goes beyond personal use:
   upwind weighting here.
 - NOAA HYSPLIT does proper back-trajectories, and NOAA HMS smoke polygons
   (the gray areas on fire.airnow.gov) mark satellite-detected smoke.
+
+## License
+
+[MIT](LICENSE). Provided as is, without warranty; see the notice at the top: for
+educational and research use only. Data from AirNow, NOAA and Open-Meteo stays under
+their own terms (see *Data sources* above).
